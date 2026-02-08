@@ -1,6 +1,19 @@
-# kislayphp_gateway
+# KislayPHP Gateway
 
 API gateway extension for KislayPHP.
+
+## Repository
+
+- https://github.com/KislayPHP/gateway
+
+## Related Modules
+
+- https://github.com/KislayPHP/core
+- https://github.com/KislayPHP/eventbus
+- https://github.com/KislayPHP/discovery
+- https://github.com/KislayPHP/config
+- https://github.com/KislayPHP/metrics
+- https://github.com/KislayPHP/queue
 
 ## Build
 
@@ -13,7 +26,7 @@ make
 ## Run Locally
 
 ```sh
-cd /path/to/phpExtension/kislayphp_gateway
+cd /path/to/gateway
 php -d extension=modules/kislayphp_gateway.so example.php
 ```
 
