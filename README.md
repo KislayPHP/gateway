@@ -1,6 +1,6 @@
 # KislayPHP Gateway
 
-KislayPHP Gateway is a minimal reverse proxy extension for routing HTTP traffic to upstream services.
+KislayPHP Gateway is a minimal reverse proxy extension for routing HTTP traffic to upstream microservices.
 
 ## Key Features
 
@@ -16,7 +16,7 @@ KislayPHP Gateway is a minimal reverse proxy extension for routing HTTP traffic 
 
 ## SEO Keywords
 
-PHP API gateway, reverse proxy, HTTP routing, C++ PHP extension, microservices
+PHP API gateway, reverse proxy, HTTP routing, upstream routing, C++ PHP extension, microservices
 
 ## Repository
 
