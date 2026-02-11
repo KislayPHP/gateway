@@ -22,20 +22,62 @@ struct kislayphp_gateway_route {
     std::string method;
     std::string path;
     std::string target;
+    std::string service;
+    bool use_service;
     std::string host;
     int port;
     std::string base_path;
 };
 
 typedef struct _php_kislayphp_gateway_t {
-    zend_object std;
     std::vector<kislayphp_gateway_route> routes;
     std::mutex lock;
     struct mg_context *ctx;
     bool running;
+    size_t max_body_bytes;
+    int thread_count;
+    zval resolver;
+    bool has_resolver;
+    zend_object std;
 } php_kislayphp_gateway_t;
 
 static zend_object_handlers kislayphp_gateway_handlers;
+
+static zend_long kislayphp_env_long(const char *name, zend_long fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    return static_cast<zend_long>(std::strtoll(value, nullptr, 10));
+}
+
+static bool kislayphp_is_hop_header(const char *name) {
+    if (name == nullptr) {
+        return false;
+    }
+    if (::strcasecmp(name, "Connection") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "Proxy-Connection") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "Keep-Alive") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "TE") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "Trailer") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "Transfer-Encoding") == 0) {
+        return true;
+    }
+    if (::strcasecmp(name, "Upgrade") == 0) {
+        return true;
+    }
+    return false;
+}
 
 static inline php_kislayphp_gateway_t *php_kislayphp_gateway_from_obj(zend_object *obj) {
     return reinterpret_cast<php_kislayphp_gateway_t *>(
@@ -51,6 +93,18 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->lock) std::mutex();
     obj->ctx = nullptr;
     obj->running = false;
+    zend_long max_body = kislayphp_env_long("KISLAY_GATEWAY_MAX_BODY", 0);
+    if (max_body < 0) {
+        max_body = 0;
+    }
+    obj->max_body_bytes = static_cast<size_t>(max_body);
+    zend_long threads = kislayphp_env_long("KISLAY_GATEWAY_THREADS", 1);
+    if (threads < 1) {
+        threads = 1;
+    }
+    obj->thread_count = static_cast<int>(threads);
+    ZVAL_UNDEF(&obj->resolver);
+    obj->has_resolver = false;
     obj->std.handlers = &kislayphp_gateway_handlers;
     return &obj->std;
 }
@@ -60,6 +114,9 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     if (obj->ctx != nullptr) {
         mg_stop(obj->ctx);
         obj->ctx = nullptr;
+    }
+    if (obj->has_resolver) {
+        zval_ptr_dtor(&obj->resolver);
     }
     obj->routes.~vector();
     obj->lock.~mutex();
@@ -132,10 +189,20 @@ static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_
     return true;
 }
 
+static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
+    ZVAL_UNDEF(retval);
+    if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
+        return false;
+    }
+    return true;
+}
+
 static void kislayphp_send_error(struct mg_connection *conn, int status, const char *message) {
     const char *status_text = "Error";
     if (status == 404) {
         status_text = "Not Found";
+    } else if (status == 413) {
+        status_text = "Payload Too Large";
     } else if (status == 502) {
         status_text = "Bad Gateway";
     }
@@ -151,7 +218,14 @@ static void kislayphp_send_error(struct mg_connection *conn, int status, const c
               message);
 }
 
-static bool kislayphp_proxy_request(struct mg_connection *conn, const struct mg_request_info *info, const kislayphp_gateway_route &route) {
+static bool kislayphp_proxy_request(struct mg_connection *conn,
+                                    const struct mg_request_info *info,
+                                    const kislayphp_gateway_route &route,
+                                    size_t max_body_bytes) {
+    if (max_body_bytes > 0 && info->content_length > static_cast<long long>(max_body_bytes)) {
+        kislayphp_send_error(conn, 413, "Payload Too Large");
+        return false;
+    }
     char error_buf[256] = {0};
     struct mg_connection *target = mg_connect_client(route.host.c_str(), route.port, 0, error_buf, sizeof(error_buf));
     if (target == nullptr) {
@@ -178,7 +252,7 @@ static bool kislayphp_proxy_request(struct mg_connection *conn, const struct mg_
         if (name == nullptr || value == nullptr) {
             continue;
         }
-        if (::strcasecmp(name, "Host") == 0 || ::strcasecmp(name, "Connection") == 0) {
+        if (::strcasecmp(name, "Host") == 0 || kislayphp_is_hop_header(name)) {
             continue;
         }
         if (::strcasecmp(name, "Content-Length") == 0) {
@@ -187,7 +261,7 @@ static bool kislayphp_proxy_request(struct mg_connection *conn, const struct mg_
         mg_printf(target, "%s: %s\r\n", name, value);
     }
 
-    if (!has_content_length) {
+    if (!has_content_length && info->content_length >= 0) {
         mg_printf(target, "Content-Length: %lld\r\n", static_cast<long long>(info->content_length));
     }
     mg_printf(target, "\r\n");
@@ -206,6 +280,39 @@ static bool kislayphp_proxy_request(struct mg_connection *conn, const struct mg_
             mg_write(target, body.data(), read_total);
         }
     }
+
+    if (mg_get_response(target, error_buf, sizeof(error_buf), 10000) < 0) {
+        mg_close_connection(target);
+        kislayphp_send_error(conn, 502, "Upstream response failed");
+        return false;
+    }
+
+    const struct mg_response_info *resp_info = mg_get_response_info(target);
+    int status_code = resp_info ? resp_info->status_code : 502;
+    const char *status_text = (resp_info && resp_info->status_text) ? resp_info->status_text : "Bad Gateway";
+    mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
+
+    bool resp_has_length = false;
+    if (resp_info) {
+        for (int i = 0; i < resp_info->num_headers; ++i) {
+            const char *name = resp_info->http_headers[i].name;
+            const char *value = resp_info->http_headers[i].value;
+            if (name == nullptr || value == nullptr) {
+                continue;
+            }
+            if (kislayphp_is_hop_header(name)) {
+                continue;
+            }
+            if (::strcasecmp(name, "Content-Length") == 0) {
+                resp_has_length = true;
+            }
+            mg_printf(conn, "%s: %s\r\n", name, value);
+        }
+        if (!resp_has_length && resp_info->content_length >= 0) {
+            mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
+        }
+    }
+    mg_printf(conn, "Connection: close\r\n\r\n");
 
     char buffer[4096];
     int read_len = 0;
@@ -230,6 +337,9 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
 
     kislayphp_gateway_route match;
     bool found = false;
+    zval resolver;
+    ZVAL_UNDEF(&resolver);
+    bool has_resolver = false;
     {
         std::lock_guard<std::mutex> guard(gateway->lock);
         for (const auto &route : gateway->routes) {
@@ -239,6 +349,10 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 break;
             }
         }
+        if (gateway->has_resolver) {
+            ZVAL_COPY(&resolver, &gateway->resolver);
+            has_resolver = true;
+        }
     }
 
     if (!found) {
@@ -246,7 +360,49 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         return 1;
     }
 
-    kislayphp_proxy_request(conn, info, match);
+    if (match.use_service) {
+        if (!has_resolver) {
+            kislayphp_send_error(conn, 502, "Service resolver not configured");
+            return 1;
+        }
+        zval args[3];
+        ZVAL_STRING(&args[0], match.service.c_str());
+        ZVAL_STRING(&args[1], method.c_str());
+        ZVAL_STRING(&args[2], path.c_str());
+        zval retval;
+        bool ok = kislayphp_call_php(&resolver, 3, args, &retval);
+        zval_ptr_dtor(&args[0]);
+        zval_ptr_dtor(&args[1]);
+        zval_ptr_dtor(&args[2]);
+        if (has_resolver) {
+            zval_ptr_dtor(&resolver);
+        }
+        if (!ok || Z_TYPE(retval) != IS_STRING) {
+            if (ok) {
+                zval_ptr_dtor(&retval);
+            }
+            kislayphp_send_error(conn, 502, "Service resolver failed");
+            return 1;
+        }
+        std::string target(Z_STRVAL(retval), Z_STRLEN(retval));
+        zval_ptr_dtor(&retval);
+
+        kislayphp_gateway_route resolved = match;
+        resolved.target = target;
+        resolved.use_service = false;
+        if (!kislayphp_parse_target(resolved.target, resolved)) {
+            kislayphp_send_error(conn, 502, "Invalid upstream target");
+            return 1;
+        }
+        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes);
+        return 1;
+    }
+
+    if (has_resolver) {
+        zval_ptr_dtor(&resolver);
+    }
+
+    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes);
     return 1;
 }
 
@@ -259,9 +415,23 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_add, 0, 0, 3)
     ZEND_ARG_TYPE_INFO(0, target, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_add_service, 0, 0, 3)
+    ZEND_ARG_TYPE_INFO(0, method, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, path, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO(0, service, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_listen, 0, 0, 2)
     ZEND_ARG_TYPE_INFO(0, host, IS_STRING, 0)
     ZEND_ARG_TYPE_INFO(0, port, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_threads, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, count, IS_LONG, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_resolver, 0, 0, 1)
+    ZEND_ARG_CALLABLE_INFO(0, resolver, 0)
 ZEND_END_ARG_INFO()
 
 PHP_METHOD(KislayPHPGateway, __construct) {
@@ -286,10 +456,40 @@ PHP_METHOD(KislayPHPGateway, addRoute) {
     route.method.assign(kislayphp_to_upper(std::string(method, method_len)));
     route.path.assign(path, path_len);
     route.target.assign(target, target_len);
+    route.use_service = false;
     if (!kislayphp_parse_target(route.target, route)) {
         zend_throw_exception(zend_ce_exception, "Invalid target (expected http://host:port)", 0);
         RETURN_FALSE;
     }
+    if (route.path.empty()) {
+        route.path = "/";
+    }
+
+    std::lock_guard<std::mutex> guard(obj->lock);
+    obj->routes.push_back(route);
+    RETURN_TRUE;
+}
+
+PHP_METHOD(KislayPHPGateway, addServiceRoute) {
+    char *method = nullptr;
+    size_t method_len = 0;
+    char *path = nullptr;
+    size_t path_len = 0;
+    char *service = nullptr;
+    size_t service_len = 0;
+    ZEND_PARSE_PARAMETERS_START(3, 3)
+        Z_PARAM_STRING(method, method_len)
+        Z_PARAM_STRING(path, path_len)
+        Z_PARAM_STRING(service, service_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    kislayphp_gateway_route route;
+    route.method.assign(kislayphp_to_upper(std::string(method, method_len)));
+    route.path.assign(path, path_len);
+    route.target.clear();
+    route.service.assign(service, service_len);
+    route.use_service = true;
     if (route.path.empty()) {
         route.path = "/";
     }
@@ -308,9 +508,56 @@ PHP_METHOD(KislayPHPGateway, routes) {
         array_init(&entry);
         add_assoc_string(&entry, "method", route.method.c_str());
         add_assoc_string(&entry, "path", route.path.c_str());
-        add_assoc_string(&entry, "target", route.target.c_str());
+        if (route.use_service) {
+            add_assoc_string(&entry, "service", route.service.c_str());
+        } else {
+            add_assoc_string(&entry, "target", route.target.c_str());
+        }
         add_next_index_zval(return_value, &entry);
     }
+}
+
+PHP_METHOD(KislayPHPGateway, setThreads) {
+    zend_long count = 1;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_LONG(count)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (count < 1) {
+        zend_throw_exception(zend_ce_exception, "Thread count must be >= 1", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    if (obj->ctx != nullptr) {
+        zend_throw_exception(zend_ce_exception, "Gateway already running", 0);
+        RETURN_FALSE;
+    }
+
+    obj->thread_count = static_cast<int>(count);
+    RETURN_TRUE;
+}
+
+PHP_METHOD(KislayPHPGateway, setResolver) {
+    zval *resolver = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ZVAL(resolver)
+    ZEND_PARSE_PARAMETERS_END();
+
+    if (!zend_is_callable(resolver, 0, nullptr)) {
+        zend_throw_exception(zend_ce_exception, "Resolver must be callable", 0);
+        RETURN_FALSE;
+    }
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    std::lock_guard<std::mutex> guard(obj->lock);
+    if (obj->has_resolver) {
+        zval_ptr_dtor(&obj->resolver);
+        obj->has_resolver = false;
+    }
+    ZVAL_COPY(&obj->resolver, resolver);
+    obj->has_resolver = true;
+    RETURN_TRUE;
 }
 
 PHP_METHOD(KislayPHPGateway, listen) {
@@ -337,8 +584,9 @@ PHP_METHOD(KislayPHPGateway, listen) {
     std::vector<const char *> options;
     options.push_back("listening_ports");
     options.push_back(listen_addr.c_str());
+    std::string threads_value = std::to_string(obj->thread_count);
     options.push_back("num_threads");
-    options.push_back("1");
+    options.push_back(threads_value.c_str());
     options.push_back(nullptr);
 
     struct mg_callbacks callbacks;
@@ -368,7 +616,10 @@ PHP_METHOD(KislayPHPGateway, stop) {
 static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, __construct, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, addRoute, arginfo_kislayphp_gateway_add, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, addServiceRoute, arginfo_kislayphp_gateway_add_service, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, routes, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setThreads, arginfo_kislayphp_gateway_set_threads, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setResolver, arginfo_kislayphp_gateway_set_resolver, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, listen, arginfo_kislayphp_gateway_listen, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, stop, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_FE_END

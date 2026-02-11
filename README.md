@@ -31,7 +31,21 @@ PHP API gateway, reverse proxy, HTTP routing, upstream routing, C++ PHP extensio
 - https://github.com/KislayPHP/metrics
 - https://github.com/KislayPHP/queue
 
-## Build
+## Installation
+
+### Via PECL
+
+```bash
+pecl install kislayphp_gateway
+```
+
+Then add to your php.ini:
+
+```ini
+extension=kislayphp_gateway.so
+```
+
+### Manual Build
 
 ```sh
 phpize

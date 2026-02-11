@@ -14,7 +14,7 @@
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-02-09</date>
+  <date>2024-10-06</date>
   <version>
     <release>0.0.1</release>
     <api>0.0.1</api>
@@ -27,7 +27,11 @@
   <notes>Initial release.</notes>
   <contents>
     <dir name="/">
-      <file name="*" role="src" />
+      <file name="config.m4" role="src" />
+      <file name="kislayphp_gateway.cpp" role="src" />
+      <file name="php_kislayphp_gateway.h" role="src" />
+      <file name="README.md" role="doc" />
+      <file name="LICENSE" role="doc" />
     </dir>
   </contents>
   <dependencies>
