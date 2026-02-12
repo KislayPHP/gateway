@@ -1,0 +1,55 @@
+{
+    "name": "kislayphp/gateway",
+    "description": "High-performance C++ PHP extension providing API gateway functionality with load balancing and routing for PHP microservices",
+    "type": "php-ext",
+    "license": "Apache-2.0",
+    "keywords": [
+        "php",
+        "microservices",
+        "php-extension",
+        "c++-extension",
+        "php-api-gateway",
+        "php-load-balancer",
+        "php-reverse-proxy",
+        "php-rate-limiting",
+        "php-service-discovery",
+        "php-authentication",
+        "php-middleware",
+        "php-microservices-gateway",
+        "php-traffic-management",
+        "php-echo-system",
+        "php-cors"
+    ],
+    "homepage": "https://github.com/KislayPHP/gateway",
+    "authors": [
+        {
+            "name": "KislayPHP Team",
+            "email": "team@kislayphp.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.2"
+    },
+    "provide": {
+        "ext-kislayphp_gateway": "*"
+    },
+    "suggest": {
+        "kislayphp/core": "HTTP/HTTPS server foundation",
+        "kislayphp/eventbus": "Real-time gateway features",
+        "kislayphp/config": "Dynamic gateway configuration",
+        "kislayphp/discovery": "Service discovery integration",
+        "kislayphp/metrics": "Gateway performance metrics",
+        "kislayphp/queue": "Request queuing and processing"
+    },
+    "support": {
+        "issues": "https://github.com/KislayPHP/gateway/issues",
+        "source": "https://github.com/KislayPHP/gateway",
+        "docs": "https://github.com/KislayPHP/gateway/blob/main/README.md"
+    },
+    "extra": {
+        "php-ext": {
+            "extension-name": "kislayphp_gateway",
+            "configure-options": []
+        }
+    }
+}
