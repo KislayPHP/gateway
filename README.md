@@ -5,7 +5,7 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/gateway/ci.yml)](https://github.com/KislayPHP/gateway/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/gateway/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/gateway)
 
-A high-performance C++ PHP extension providing API gateway functionality with load balancing, routing, rate limiting, and service discovery integration.
+A high-performance C++ PHP extension providing API gateway functionality with load balancing, routing, rate limiting, and service discovery integration. Perfect for PHP echo system integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
@@ -17,6 +17,8 @@ A high-performance C++ PHP extension providing API gateway functionality with lo
 - 🔐 **Authentication**: JWT, OAuth2, and custom auth middleware
 - 📝 **Logging**: Structured request/response logging
 - 🌐 **CORS**: Cross-origin resource sharing support
+- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
 ## 📦 Installation
 
@@ -311,6 +313,10 @@ Licensed under the [Apache License 2.0](LICENSE).
 - 🐛 [Issue Tracker](https://github.com/KislayPHP/gateway/issues)
 - 💬 [Discussions](https://github.com/KislayPHP/gateway/discussions)
 - 📧 [Security Issues](.github/SECURITY.md)
+
+## SEO Keywords
+
+PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP API gateway, PHP load balancer, PHP reverse proxy, PHP rate limiting, PHP service discovery, PHP authentication, PHP middleware, PHP microservices gateway
 
 ## 📈 Roadmap
 
