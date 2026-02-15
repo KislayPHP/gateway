@@ -46,10 +46,8 @@
         "source": "https://github.com/KislayPHP/gateway",
         "docs": "https://github.com/KislayPHP/gateway/blob/main/README.md"
     },
-    "extra": {
-        "php-ext": {
-            "extension-name": "kislayphp_gateway",
-            "configure-options": []
-        }
+    "php-ext": {
+        "extension-name": "kislayphp_gateway",
+        "configure-options": []
     }
 }
