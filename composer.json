@@ -7,7 +7,7 @@
         "php",
         "microservices",
         "php-extension",
-        "c++-extension",
+        "cpp-extension",
         "php-api-gateway",
         "php-load-balancer",
         "php-reverse-proxy",
