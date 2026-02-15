@@ -31,6 +31,8 @@ struct kislayphp_gateway_route {
 
 typedef struct _php_kislayphp_gateway_t {
     std::vector<kislayphp_gateway_route> routes;
+    kislayphp_gateway_route fallback_route;
+    bool has_fallback;
     std::mutex lock;
     struct mg_context *ctx;
     bool running;
@@ -93,6 +95,7 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->lock) std::mutex();
     obj->ctx = nullptr;
     obj->running = false;
+    obj->has_fallback = false;
     zend_long max_body = kislayphp_env_long("KISLAY_GATEWAY_MAX_BODY", 0);
     if (max_body < 0) {
         max_body = 0;
@@ -145,6 +148,26 @@ static std::string kislayphp_join_paths(const std::string &base, const std::stri
         return base + "/" + path;
     }
     return base + path;
+}
+
+static bool kislayphp_path_matches(const std::string &pattern, const std::string &path) {
+    if (pattern.empty()) {
+        return path.empty() || path == "/";
+    }
+    if (pattern == path) {
+        return true;
+    }
+    if (pattern.back() != '*') {
+        return false;
+    }
+    std::string prefix = pattern.substr(0, pattern.size() - 1);
+    if (prefix.empty()) {
+        return true;
+    }
+    if (path.size() < prefix.size()) {
+        return false;
+    }
+    return path.compare(0, prefix.size(), prefix) == 0;
 }
 
 static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_route &route) {
@@ -343,11 +366,15 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     {
         std::lock_guard<std::mutex> guard(gateway->lock);
         for (const auto &route : gateway->routes) {
-            if (route.method == method && route.path == path) {
+            if (route.method == method && kislayphp_path_matches(route.path, path)) {
                 match = route;
                 found = true;
                 break;
             }
+        }
+        if (!found && gateway->has_fallback) {
+            match = gateway->fallback_route;
+            found = true;
         }
         if (gateway->has_resolver) {
             ZVAL_COPY(&resolver, &gateway->resolver);
@@ -432,6 +459,14 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_resolver, 0, 0, 1)
     ZEND_ARG_CALLABLE_INFO(0, resolver, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_fallback, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, target, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_fallback_service, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, service, IS_STRING, 0)
 ZEND_END_ARG_INFO()
 
 PHP_METHOD(KislayPHPGateway, __construct) {
@@ -603,6 +638,51 @@ PHP_METHOD(KislayPHPGateway, listen) {
     RETURN_TRUE;
 }
 
+PHP_METHOD(KislayPHPGateway, setFallbackTarget) {
+    char *target = nullptr;
+    size_t target_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(target, target_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    kislayphp_gateway_route route;
+    route.method = "*";
+    route.path = "*";
+    route.target.assign(target, target_len);
+    route.use_service = false;
+    if (!kislayphp_parse_target(route.target, route)) {
+        zend_throw_exception(zend_ce_exception, "Invalid fallback target (expected http://host:port)", 0);
+        RETURN_FALSE;
+    }
+
+    std::lock_guard<std::mutex> guard(obj->lock);
+    obj->fallback_route = route;
+    obj->has_fallback = true;
+    RETURN_TRUE;
+}
+
+PHP_METHOD(KislayPHPGateway, setFallbackService) {
+    char *service = nullptr;
+    size_t service_len = 0;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_STRING(service, service_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    kislayphp_gateway_route route;
+    route.method = "*";
+    route.path = "*";
+    route.target.clear();
+    route.service.assign(service, service_len);
+    route.use_service = true;
+
+    std::lock_guard<std::mutex> guard(obj->lock);
+    obj->fallback_route = route;
+    obj->has_fallback = true;
+    RETURN_TRUE;
+}
+
 PHP_METHOD(KislayPHPGateway, stop) {
     php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
     obj->running = false;
@@ -620,6 +700,8 @@ static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, routes, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setThreads, arginfo_kislayphp_gateway_set_threads, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setResolver, arginfo_kislayphp_gateway_set_resolver, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setFallbackTarget, arginfo_kislayphp_gateway_set_fallback, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setFallbackService, arginfo_kislayphp_gateway_set_fallback_service, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, listen, arginfo_kislayphp_gateway_listen, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, stop, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_FE_END
