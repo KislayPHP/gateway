@@ -21,9 +21,9 @@ The KislayPHP Gateway extension provides high-performance API gateway functional
 
 ## Installation
 
-### Via PECL
+### Via PIE
 ```bash
-pecl install kislayphp_gateway
+pie install kislayphp/gateway
 ```
 
 ### Manual Build

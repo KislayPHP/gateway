@@ -22,10 +22,10 @@ A high-performance C++ PHP extension providing API gateway functionality with lo
 
 ## 📦 Installation
 
-### Via PECL (Recommended)
+### Via PIE (Recommended)
 
 ```bash
-pecl install kislayphp_gateway
+pie install kislayphp/gateway
 ```
 
 Add to your `php.ini`:
@@ -49,7 +49,6 @@ sudo make install
 
 ```dockerfile
 FROM php:8.2-cli
-RUN pecl install kislayphp_gateway && docker-php-ext-enable kislayphp_gateway
 ```
 
 ## 🚀 Quick Start
