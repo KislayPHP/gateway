@@ -5,7 +5,7 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/KislayPHP/gateway/ci.yml)](https://github.com/KislayPHP/gateway/actions)
 [![codecov](https://codecov.io/gh/KislayPHP/gateway/branch/main/graph/badge.svg)](https://codecov.io/gh/KislayPHP/gateway)
 
-A high-performance C++ PHP extension providing API gateway functionality with load balancing, routing, rate limiting, and service discovery integration. Perfect for PHP echo system integration and modern microservices architecture.
+A high-performance C++ PHP extension providing API gateway functionality with load balancing, routing, rate limiting, and service discovery integration. Perfect for PHP ecosystem integration and modern microservices architecture.
 
 ## ⚡ Key Features
 
@@ -17,7 +17,7 @@ A high-performance C++ PHP extension providing API gateway functionality with lo
 - 🔐 **Authentication**: JWT, OAuth2, and custom auth middleware
 - 📝 **Logging**: Structured request/response logging
 - 🌐 **CORS**: Cross-origin resource sharing support
-- 🔄 **PHP Echo System**: Seamless integration with PHP ecosystem and frameworks
+- 🔄 **PHP Ecosystem**: Seamless integration with PHP ecosystem and frameworks
 - 🌐 **Microservices Architecture**: Designed for distributed PHP applications
 
 ## 📦 Installation
@@ -45,9 +45,9 @@ make
 sudo make install
 ```
 
-### Docker
+### container
 
-```dockerfile
+```containerfile
 FROM php:8.2-cli
 ```
 
@@ -177,7 +177,7 @@ $gateway->addOAuth2Provider('google', [
 $gateway = new KislayGateway();
 
 // Integrate with Discovery service
-$discovery = new KislayDiscovery(['backend' => 'consul']);
+$discovery = new KislayDiscovery(['backend' => 'registry']);
 
 $gateway->enableServiceDiscovery($discovery, [
     'service_prefix' => 'api-',
@@ -315,7 +315,7 @@ Licensed under the [Apache License 2.0](LICENSE).
 
 ## SEO Keywords
 
-PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP API gateway, PHP load balancer, PHP reverse proxy, PHP rate limiting, PHP service discovery, PHP authentication, PHP middleware, PHP microservices gateway
+PHP, microservices, PHP ecosystem, PHP extension, C++ PHP extension, PHP API gateway, PHP load balancer, PHP reverse proxy, PHP rate limiting, PHP service discovery, PHP authentication, PHP middleware, PHP microservices gateway
 
 ## 📈 Roadmap
 
@@ -323,7 +323,7 @@ PHP, microservices, PHP echo system, PHP extension, C++ PHP extension, PHP API g
 - [ ] WebSocket proxying
 - [ ] Advanced circuit breaker
 - [ ] Service mesh integration
-- [ ] Kubernetes ingress controller
+- [ ] orchestrator ingress controller
 - [ ] Advanced monitoring dashboard
 
 ## 🙏 Acknowledgments

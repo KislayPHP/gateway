@@ -6,15 +6,24 @@ extern "C" {
 
 #include "php_kislayphp_gateway.h"
 
+#include <chrono>
 #include <civetweb.h>
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <mutex>
 #include <strings.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#ifdef KISLAYPHP_RPC
+#include <grpcpp/grpcpp.h>
+
+#include "discovery.grpc.pb.h"
+#endif
 
 static zend_class_entry *kislayphp_gateway_ce;
 
@@ -29,6 +38,16 @@ struct kislayphp_gateway_route {
     std::string base_path;
 };
 
+struct kislayphp_rate_limit_entry {
+    std::time_t window_start;
+    zend_long count;
+};
+
+struct kislayphp_circuit_state {
+    zend_long failures;
+    std::time_t open_until;
+};
+
 typedef struct _php_kislayphp_gateway_t {
     std::vector<kislayphp_gateway_route> routes;
     kislayphp_gateway_route fallback_route;
@@ -40,6 +59,17 @@ typedef struct _php_kislayphp_gateway_t {
     int thread_count;
     zval resolver;
     bool has_resolver;
+    bool auth_required;
+    std::string auth_bearer_token;
+    std::vector<std::string> auth_exclude_prefixes;
+    bool rate_limit_enabled;
+    zend_long rate_limit_requests;
+    zend_long rate_limit_window_seconds;
+    std::unordered_map<std::string, kislayphp_rate_limit_entry> rate_limits;
+    bool circuit_breaker_enabled;
+    zend_long circuit_failure_threshold;
+    zend_long circuit_open_seconds;
+    std::unordered_map<std::string, kislayphp_circuit_state> circuit_states;
     zend_object std;
 } php_kislayphp_gateway_t;
 
@@ -81,6 +111,171 @@ static bool kislayphp_is_hop_header(const char *name) {
     return false;
 }
 
+static bool kislayphp_env_bool(const char *name, bool fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return fallback;
+    }
+    if (::strcasecmp(value, "1") == 0 || ::strcasecmp(value, "true") == 0 ||
+        ::strcasecmp(value, "yes") == 0 || ::strcasecmp(value, "on") == 0) {
+        return true;
+    }
+    if (::strcasecmp(value, "0") == 0 || ::strcasecmp(value, "false") == 0 ||
+        ::strcasecmp(value, "no") == 0 || ::strcasecmp(value, "off") == 0) {
+        return false;
+    }
+    return fallback;
+}
+
+static std::string kislayphp_env_string(const char *name, const char *fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return std::string(fallback ? fallback : "");
+    }
+    return std::string(value);
+}
+
+#ifdef KISLAYPHP_RPC
+static bool kislayphp_rpc_enabled() {
+    return kislayphp_env_bool("KISLAY_RPC_ENABLED", false);
+}
+
+static zend_long kislayphp_rpc_timeout_ms() {
+    zend_long timeout = kislayphp_env_long("KISLAY_RPC_TIMEOUT_MS", 200);
+    return timeout > 0 ? timeout : 200;
+}
+
+static std::string kislayphp_rpc_discovery_endpoint() {
+    return kislayphp_env_string("KISLAY_RPC_DISCOVERY_ENDPOINT", "127.0.0.1:9090");
+}
+
+static kislay::discovery::v1::DiscoveryService::Stub *kislayphp_rpc_discovery_stub(const std::string &endpoint) {
+    static std::mutex lock;
+    static std::string cached_endpoint;
+    static std::shared_ptr<grpc::Channel> channel;
+    static std::unique_ptr<kislay::discovery::v1::DiscoveryService::Stub> stub;
+    std::lock_guard<std::mutex> guard(lock);
+    if (!stub || cached_endpoint != endpoint) {
+        channel = grpc::CreateChannel(endpoint, grpc::InsecureChannelCredentials());
+        stub = kislay::discovery::v1::DiscoveryService::NewStub(channel);
+        cached_endpoint = endpoint;
+    }
+    return stub.get();
+}
+
+static bool kislayphp_rpc_resolve_service(const std::string &service, std::string *target, std::string *error) {
+    auto *stub = kislayphp_rpc_discovery_stub(kislayphp_rpc_discovery_endpoint());
+    if (!stub) {
+        if (error) {
+            *error = "RPC stub unavailable";
+        }
+        return false;
+    }
+
+    kislay::discovery::v1::ResolveRequest request;
+    request.set_service_name(service);
+    kislay::discovery::v1::ResolveResponse response;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(kislayphp_rpc_timeout_ms()));
+
+    grpc::Status status = stub->Resolve(&context, request, &response);
+    if (!status.ok()) {
+        if (error) {
+            *error = status.error_message();
+        }
+        return false;
+    }
+    if (!response.ok()) {
+        if (error) {
+            *error = response.error();
+        }
+        return false;
+    }
+    if (target) {
+        *target = response.instance().url();
+    }
+    return true;
+}
+#endif
+
+static std::string kislayphp_trim(const std::string &value) {
+    size_t start = 0;
+    while (start < value.size() && std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+    size_t end = value.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+    return value.substr(start, end - start);
+}
+
+static std::vector<std::string> kislayphp_split_csv(const std::string &csv) {
+    std::vector<std::string> out;
+    size_t start = 0;
+    while (start <= csv.size()) {
+        size_t comma = csv.find(',', start);
+        std::string chunk = (comma == std::string::npos)
+            ? csv.substr(start)
+            : csv.substr(start, comma - start);
+        chunk = kislayphp_trim(chunk);
+        if (!chunk.empty()) {
+            out.push_back(chunk);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return out;
+}
+
+static const char *kislayphp_get_header(const struct mg_request_info *info, const char *name) {
+    if (info == nullptr || name == nullptr) {
+        return nullptr;
+    }
+    for (int i = 0; i < info->num_headers; ++i) {
+        const char *hname = info->http_headers[i].name;
+        const char *hvalue = info->http_headers[i].value;
+        if (hname == nullptr || hvalue == nullptr) {
+            continue;
+        }
+        if (::strcasecmp(hname, name) == 0) {
+            return hvalue;
+        }
+    }
+    return nullptr;
+}
+
+static bool kislayphp_has_prefix(const std::string &value, const std::string &prefix) {
+    if (prefix.empty()) {
+        return false;
+    }
+    if (value.size() < prefix.size()) {
+        return false;
+    }
+    return value.compare(0, prefix.size(), prefix) == 0;
+}
+
+static std::string kislayphp_client_identifier(const struct mg_request_info *info) {
+    const char *xff = kislayphp_get_header(info, "X-Forwarded-For");
+    if (xff != nullptr && *xff != '\0') {
+        std::string value(xff);
+        size_t comma = value.find(',');
+        if (comma != std::string::npos) {
+            value = value.substr(0, comma);
+        }
+        value = kislayphp_trim(value);
+        if (!value.empty()) {
+            return value;
+        }
+    }
+    if (info != nullptr && *(info->remote_addr) != '\0') {
+        return std::string(info->remote_addr);
+    }
+    return std::string("unknown");
+}
+
 static inline php_kislayphp_gateway_t *php_kislayphp_gateway_from_obj(zend_object *obj) {
     return reinterpret_cast<php_kislayphp_gateway_t *>(
         reinterpret_cast<char *>(obj) - XtOffsetOf(php_kislayphp_gateway_t, std));
@@ -108,6 +303,28 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     obj->thread_count = static_cast<int>(threads);
     ZVAL_UNDEF(&obj->resolver);
     obj->has_resolver = false;
+    obj->auth_required = kislayphp_env_bool("KISLAY_GATEWAY_AUTH_REQUIRED", false);
+    obj->auth_bearer_token = kislayphp_env_string("KISLAY_GATEWAY_AUTH_TOKEN", "");
+    obj->auth_exclude_prefixes = kislayphp_split_csv(
+        kislayphp_env_string("KISLAY_GATEWAY_AUTH_EXCLUDE", "/health,/ready,/metrics"));
+    obj->rate_limit_enabled = kislayphp_env_bool("KISLAY_GATEWAY_RATE_LIMIT_ENABLED", false);
+    obj->rate_limit_requests = kislayphp_env_long("KISLAY_GATEWAY_RATE_LIMIT_REQUESTS", 120);
+    if (obj->rate_limit_requests < 1) {
+        obj->rate_limit_requests = 1;
+    }
+    obj->rate_limit_window_seconds = kislayphp_env_long("KISLAY_GATEWAY_RATE_LIMIT_WINDOW", 60);
+    if (obj->rate_limit_window_seconds < 1) {
+        obj->rate_limit_window_seconds = 1;
+    }
+    obj->circuit_breaker_enabled = kislayphp_env_bool("KISLAY_GATEWAY_CIRCUIT_BREAKER_ENABLED", false);
+    obj->circuit_failure_threshold = kislayphp_env_long("KISLAY_GATEWAY_CB_FAILURE_THRESHOLD", 5);
+    if (obj->circuit_failure_threshold < 1) {
+        obj->circuit_failure_threshold = 1;
+    }
+    obj->circuit_open_seconds = kislayphp_env_long("KISLAY_GATEWAY_CB_OPEN_SECONDS", 30);
+    if (obj->circuit_open_seconds < 1) {
+        obj->circuit_open_seconds = 1;
+    }
     obj->std.handlers = &kislayphp_gateway_handlers;
     return &obj->std;
 }
@@ -222,12 +439,18 @@ static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *
 
 static void kislayphp_send_error(struct mg_connection *conn, int status, const char *message) {
     const char *status_text = "Error";
-    if (status == 404) {
+    if (status == 401) {
+        status_text = "Unauthorized";
+    } else if (status == 404) {
         status_text = "Not Found";
     } else if (status == 413) {
         status_text = "Payload Too Large";
+    } else if (status == 429) {
+        status_text = "Too Many Requests";
     } else if (status == 502) {
         status_text = "Bad Gateway";
+    } else if (status == 503) {
+        status_text = "Service Unavailable";
     }
     mg_printf(conn,
               "HTTP/1.1 %d %s\r\n"
@@ -244,15 +467,25 @@ static void kislayphp_send_error(struct mg_connection *conn, int status, const c
 static bool kislayphp_proxy_request(struct mg_connection *conn,
                                     const struct mg_request_info *info,
                                     const kislayphp_gateway_route &route,
-                                    size_t max_body_bytes) {
+                                    size_t max_body_bytes,
+                                    int *status_code_out) {
+    if (status_code_out != nullptr) {
+        *status_code_out = 0;
+    }
     if (max_body_bytes > 0 && info->content_length > static_cast<long long>(max_body_bytes)) {
         kislayphp_send_error(conn, 413, "Payload Too Large");
+        if (status_code_out != nullptr) {
+            *status_code_out = 413;
+        }
         return false;
     }
     char error_buf[256] = {0};
     struct mg_connection *target = mg_connect_client(route.host.c_str(), route.port, 0, error_buf, sizeof(error_buf));
     if (target == nullptr) {
         kislayphp_send_error(conn, 502, "Upstream connect failed");
+        if (status_code_out != nullptr) {
+            *status_code_out = 502;
+        }
         return false;
     }
 
@@ -307,11 +540,17 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     if (mg_get_response(target, error_buf, sizeof(error_buf), 10000) < 0) {
         mg_close_connection(target);
         kislayphp_send_error(conn, 502, "Upstream response failed");
+        if (status_code_out != nullptr) {
+            *status_code_out = 502;
+        }
         return false;
     }
 
     const struct mg_response_info *resp_info = mg_get_response_info(target);
     int status_code = resp_info ? resp_info->status_code : 502;
+    if (status_code_out != nullptr) {
+        *status_code_out = status_code;
+    }
     const char *status_text = (resp_info && resp_info->status_text) ? resp_info->status_text : "Bad Gateway";
     mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
 
@@ -358,6 +597,53 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     method = kislayphp_to_upper(method);
     std::string path = info->local_uri ? info->local_uri : (info->request_uri ? info->request_uri : "");
 
+    if (gateway->auth_required) {
+        bool excluded = false;
+        for (const auto &prefix : gateway->auth_exclude_prefixes) {
+            if (kislayphp_has_prefix(path, prefix)) {
+                excluded = true;
+                break;
+            }
+        }
+
+        if (!excluded) {
+            if (gateway->auth_bearer_token.empty()) {
+                kislayphp_send_error(conn, 503, "Gateway auth token not configured");
+                return 1;
+            }
+
+            const char *auth = kislayphp_get_header(info, "Authorization");
+            if (auth == nullptr || *auth == '\0') {
+                kislayphp_send_error(conn, 401, "Missing Authorization header");
+                return 1;
+            }
+            std::string expected = "Bearer ";
+            expected.append(gateway->auth_bearer_token);
+            if (std::string(auth) != expected) {
+                kislayphp_send_error(conn, 401, "Invalid Authorization token");
+                return 1;
+            }
+        }
+    }
+
+    if (gateway->rate_limit_enabled) {
+        std::time_t now = std::time(nullptr);
+        std::string key = kislayphp_client_identifier(info);
+        key.push_back('|');
+        key.append(method);
+        std::lock_guard<std::mutex> guard(gateway->lock);
+        auto &entry = gateway->rate_limits[key];
+        if (entry.window_start == 0 || (now - entry.window_start) >= gateway->rate_limit_window_seconds) {
+            entry.window_start = now;
+            entry.count = 0;
+        }
+        if (entry.count >= gateway->rate_limit_requests) {
+            kislayphp_send_error(conn, 429, "Rate limit exceeded");
+            return 1;
+        }
+        entry.count++;
+    }
+
     kislayphp_gateway_route match;
     bool found = false;
     zval resolver;
@@ -388,7 +674,16 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     }
 
     if (match.use_service) {
-        if (!has_resolver) {
+        std::string rpc_target;
+        bool rpc_ok = false;
+#ifdef KISLAYPHP_RPC
+        if (!has_resolver && kislayphp_rpc_enabled()) {
+            std::string error;
+            rpc_ok = kislayphp_rpc_resolve_service(match.service, &rpc_target, &error);
+        }
+#endif
+
+        if (!has_resolver && !rpc_ok) {
             kislayphp_send_error(conn, 502, "Service resolver not configured");
             return 1;
         }
@@ -397,22 +692,33 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         ZVAL_STRING(&args[1], method.c_str());
         ZVAL_STRING(&args[2], path.c_str());
         zval retval;
-        bool ok = kislayphp_call_php(&resolver, 3, args, &retval);
+        bool ok = false;
+        if (has_resolver) {
+            ok = kislayphp_call_php(&resolver, 3, args, &retval);
+        }
         zval_ptr_dtor(&args[0]);
         zval_ptr_dtor(&args[1]);
         zval_ptr_dtor(&args[2]);
         if (has_resolver) {
             zval_ptr_dtor(&resolver);
         }
-        if (!ok || Z_TYPE(retval) != IS_STRING) {
-            if (ok) {
-                zval_ptr_dtor(&retval);
+        std::string target;
+        if (has_resolver) {
+            if (!ok || Z_TYPE(retval) != IS_STRING) {
+                if (ok) {
+                    zval_ptr_dtor(&retval);
+                }
+                kislayphp_send_error(conn, 502, "Service resolver failed");
+                return 1;
             }
+            target.assign(Z_STRVAL(retval), Z_STRLEN(retval));
+            zval_ptr_dtor(&retval);
+        } else if (rpc_ok) {
+            target = rpc_target;
+        } else {
             kislayphp_send_error(conn, 502, "Service resolver failed");
             return 1;
         }
-        std::string target(Z_STRVAL(retval), Z_STRLEN(retval));
-        zval_ptr_dtor(&retval);
 
         kislayphp_gateway_route resolved = match;
         resolved.target = target;
@@ -421,7 +727,37 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             kislayphp_send_error(conn, 502, "Invalid upstream target");
             return 1;
         }
-        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes);
+        if (gateway->circuit_breaker_enabled) {
+            std::time_t now = std::time(nullptr);
+            std::string upstream_key = resolved.host + ":" + std::to_string(resolved.port);
+            {
+                std::lock_guard<std::mutex> guard(gateway->lock);
+                auto it = gateway->circuit_states.find(upstream_key);
+                if (it != gateway->circuit_states.end() && it->second.open_until > now) {
+                    kislayphp_send_error(conn, 503, "Circuit breaker open");
+                    return 1;
+                }
+            }
+
+            int upstream_status = 0;
+            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status);
+            bool failed = !ok_proxy || upstream_status >= 500;
+            std::lock_guard<std::mutex> guard(gateway->lock);
+            auto &state = gateway->circuit_states[upstream_key];
+            if (failed) {
+                state.failures++;
+                if (state.failures >= gateway->circuit_failure_threshold) {
+                    state.open_until = now + gateway->circuit_open_seconds;
+                    state.failures = 0;
+                }
+            } else {
+                state.failures = 0;
+                state.open_until = 0;
+            }
+            return 1;
+        }
+
+        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr);
         return 1;
     }
 
@@ -429,7 +765,37 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         zval_ptr_dtor(&resolver);
     }
 
-    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes);
+    if (gateway->circuit_breaker_enabled) {
+        std::time_t now = std::time(nullptr);
+        std::string upstream_key = match.host + ":" + std::to_string(match.port);
+        {
+            std::lock_guard<std::mutex> guard(gateway->lock);
+            auto it = gateway->circuit_states.find(upstream_key);
+            if (it != gateway->circuit_states.end() && it->second.open_until > now) {
+                kislayphp_send_error(conn, 503, "Circuit breaker open");
+                return 1;
+            }
+        }
+
+        int upstream_status = 0;
+        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status);
+        bool failed = !ok_proxy || upstream_status >= 500;
+        std::lock_guard<std::mutex> guard(gateway->lock);
+        auto &state = gateway->circuit_states[upstream_key];
+        if (failed) {
+            state.failures++;
+            if (state.failures >= gateway->circuit_failure_threshold) {
+                state.open_until = now + gateway->circuit_open_seconds;
+                state.failures = 0;
+            }
+        } else {
+            state.failures = 0;
+            state.open_until = 0;
+        }
+        return 1;
+    }
+
+    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr);
     return 1;
 }
 

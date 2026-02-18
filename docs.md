@@ -16,7 +16,7 @@ The KislayPHP Gateway extension provides high-performance API gateway functional
 ### Supported Protocols
 - HTTP/1.1 and HTTP/2
 - WebSocket proxying
-- gRPC transcoding (planned)
+- RPC transcoding (planned)
 - Custom protocol handlers
 
 ## Installation
@@ -745,15 +745,15 @@ $gateway->addRoute($userRoute);
 
 ## Integration Examples
 
-### Kubernetes Ingress Integration
+### orchestrator Ingress Integration
 ```php
 <?php
-class KubernetesGateway extends Gateway {
+class orchestratorGateway extends Gateway {
     private $kubeClient;
 
     public function __construct(array $config = []) {
         parent::__construct($config);
-        $this->kubeClient = new KubernetesClient();
+        $this->kubeClient = new orchestratorClient();
         $this->setupFromIngress();
     }
 
@@ -806,7 +806,7 @@ class KubernetesGateway extends Gateway {
 }
 
 // Usage
-$kubeGateway = new KubernetesGateway([
+$kubeGateway = new orchestratorGateway([
     'host' => '0.0.0.0',
     'port' => 80
 ]);
