@@ -23,7 +23,8 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
     CXXFLAGS="$CXXFLAGS -DKISLAYPHP_RPC"
     RPC_SRCS="../rpc/gen/discovery.pb.cc ../rpc/gen/discovery.grpc.pb.cc"
   else
-    AC_MSG_ERROR([RPC stubs not found. Run ./scripts/generate_rpc_stubs.sh])
+    AC_MSG_WARN([RPC stubs not found. Building without RPC service resolution support.])
+    RPC_SRCS=""
   fi
 
   PHP_NEW_EXTENSION(kislayphp_gateway, kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $RPC_SRCS, $ext_shared)

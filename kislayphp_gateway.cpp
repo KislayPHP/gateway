@@ -35,6 +35,7 @@ struct kislayphp_gateway_route {
     bool use_service;
     std::string host;
     int port;
+    bool use_tls;
     std::string base_path;
 };
 
@@ -133,6 +134,30 @@ static std::string kislayphp_env_string(const char *name, const char *fallback) 
         return std::string(fallback ? fallback : "");
     }
     return std::string(value);
+}
+
+static void kislayphp_disable_stack_guard_for_nts(const char *source) {
+#if !defined(ZTS)
+    (void) source;
+    EG(max_allowed_stack_size) = -1;
+    EG(stack_limit) = nullptr;
+#else
+    (void) source;
+#endif
+}
+
+static int kislayphp_sanitize_thread_count(int requested, const char *source) {
+    if (requested < 1) {
+        php_error_docref(nullptr, E_WARNING, "%s: invalid thread count %d; using 1", source, requested);
+        return 1;
+    }
+#if !defined(ZTS)
+    if (requested > 1) {
+        php_error_docref(nullptr, E_WARNING, "%s: Thread Safety is disabled; forcing num_threads=1", source);
+        return 1;
+    }
+#endif
+    return requested;
 }
 
 #ifdef KISLAYPHP_RPC
@@ -287,7 +312,12 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     zend_object_std_init(&obj->std, ce);
     object_properties_init(&obj->std, ce);
     new (&obj->routes) std::vector<kislayphp_gateway_route>();
+    new (&obj->fallback_route) kislayphp_gateway_route();
     new (&obj->lock) std::mutex();
+    new (&obj->auth_bearer_token) std::string();
+    new (&obj->auth_exclude_prefixes) std::vector<std::string>();
+    new (&obj->rate_limits) std::unordered_map<std::string, kislayphp_rate_limit_entry>();
+    new (&obj->circuit_states) std::unordered_map<std::string, kislayphp_circuit_state>();
     obj->ctx = nullptr;
     obj->running = false;
     obj->has_fallback = false;
@@ -297,10 +327,7 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     }
     obj->max_body_bytes = static_cast<size_t>(max_body);
     zend_long threads = kislayphp_env_long("KISLAY_GATEWAY_THREADS", 1);
-    if (threads < 1) {
-        threads = 1;
-    }
-    obj->thread_count = static_cast<int>(threads);
+    obj->thread_count = kislayphp_sanitize_thread_count(static_cast<int>(threads), "Kislay\\Gateway\\Gateway::__construct");
     ZVAL_UNDEF(&obj->resolver);
     obj->has_resolver = false;
     obj->auth_required = kislayphp_env_bool("KISLAY_GATEWAY_AUTH_REQUIRED", false);
@@ -338,7 +365,12 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     if (obj->has_resolver) {
         zval_ptr_dtor(&obj->resolver);
     }
+    obj->circuit_states.~unordered_map();
+    obj->rate_limits.~unordered_map();
+    obj->auth_exclude_prefixes.~vector();
+    obj->auth_bearer_token.~basic_string();
     obj->routes.~vector();
+    obj->fallback_route.~kislayphp_gateway_route();
     obj->lock.~mutex();
     zend_object_std_dtor(&obj->std);
 }
@@ -348,6 +380,23 @@ static std::string kislayphp_to_upper(const std::string &value) {
     std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
         return static_cast<char>(std::toupper(c));
     });
+    return out;
+}
+
+static std::string kislayphp_exception_debug_string() {
+    if (EG(exception) == nullptr) {
+        return "";
+    }
+    zend_object *exception = EG(exception);
+    std::string class_name = exception->ce != nullptr
+        ? std::string(ZSTR_VAL(exception->ce->name))
+        : "Exception";
+    zval rv_message;
+    zval *message = zend_read_property(exception->ce, exception, ZEND_STRL("message"), 1, &rv_message);
+    std::string out = class_name;
+    if (message != nullptr && Z_TYPE_P(message) == IS_STRING && Z_STRLEN_P(message) > 0) {
+        out += ": " + std::string(Z_STRVAL_P(message), Z_STRLEN_P(message));
+    }
     return out;
 }
 
@@ -389,9 +438,14 @@ static bool kislayphp_path_matches(const std::string &pattern, const std::string
 
 static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_route &route) {
     std::string value = target;
-    const std::string prefix = "http://";
-    if (value.rfind(prefix, 0) == 0) {
-        value = value.substr(prefix.size());
+    const std::string http_prefix = "http://";
+    const std::string https_prefix = "https://";
+    bool use_tls = false;
+    if (value.rfind(http_prefix, 0) == 0) {
+        value = value.substr(http_prefix.size());
+    } else if (value.rfind(https_prefix, 0) == 0) {
+        value = value.substr(https_prefix.size());
+        use_tls = true;
     }
 
     std::string hostport;
@@ -409,7 +463,7 @@ static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_
     }
 
     std::string host = hostport;
-    int port = 80;
+    int port = use_tls ? 443 : 80;
     size_t colon = hostport.find(':');
     if (colon != std::string::npos) {
         host = hostport.substr(0, colon);
@@ -425,14 +479,25 @@ static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_
 
     route.host = host;
     route.port = port;
+    route.use_tls = use_tls;
     route.base_path = base_path;
     return true;
 }
 
-static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval) {
+static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval, std::string *error_out = nullptr) {
     ZVAL_UNDEF(retval);
     if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
+        if (error_out != nullptr) {
+            *error_out = "call_user_function failed";
+            std::string exception_text = kislayphp_exception_debug_string();
+            if (!exception_text.empty()) {
+                *error_out += " (" + exception_text + ")";
+            }
+        }
         return false;
+    }
+    if (error_out != nullptr && EG(exception) != nullptr) {
+        *error_out = "exception in callback (" + kislayphp_exception_debug_string() + ")";
     }
     return true;
 }
@@ -480,8 +545,13 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         return false;
     }
     char error_buf[256] = {0};
-    struct mg_connection *target = mg_connect_client(route.host.c_str(), route.port, 0, error_buf, sizeof(error_buf));
+    struct mg_connection *target = mg_connect_client(route.host.c_str(), route.port, route.use_tls ? 1 : 0, error_buf, sizeof(error_buf));
     if (target == nullptr) {
+        php_error_docref(nullptr, E_WARNING, "Upstream connect failed for %s://%s:%d (%s)",
+                         route.use_tls ? "https" : "http",
+                         route.host.c_str(),
+                         route.port,
+                         error_buf[0] != '\0' ? error_buf : "unknown error");
         kislayphp_send_error(conn, 502, "Upstream connect failed");
         if (status_code_out != nullptr) {
             *status_code_out = 502;
@@ -694,7 +764,11 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         zval retval;
         bool ok = false;
         if (has_resolver) {
-            ok = kislayphp_call_php(&resolver, 3, args, &retval);
+            std::string resolver_error;
+            ok = kislayphp_call_php(&resolver, 3, args, &retval, &resolver_error);
+            if ((!ok || EG(exception) != nullptr) && !resolver_error.empty()) {
+                php_error_docref(nullptr, E_WARNING, "Gateway resolver failure: %s", resolver_error.c_str());
+            }
         }
         zval_ptr_dtor(&args[0]);
         zval_ptr_dtor(&args[1]);
@@ -704,7 +778,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         }
         std::string target;
         if (has_resolver) {
-            if (!ok || Z_TYPE(retval) != IS_STRING) {
+            if (!ok || EG(exception) != nullptr || Z_TYPE(retval) != IS_STRING) {
                 if (ok) {
                     zval_ptr_dtor(&retval);
                 }
@@ -858,8 +932,9 @@ PHP_METHOD(KislayPHPGateway, addRoute) {
     route.path.assign(path, path_len);
     route.target.assign(target, target_len);
     route.use_service = false;
+    route.use_tls = false;
     if (!kislayphp_parse_target(route.target, route)) {
-        zend_throw_exception(zend_ce_exception, "Invalid target (expected http://host:port)", 0);
+        zend_throw_exception(zend_ce_exception, "Invalid target (expected http(s)://host[:port][/base])", 0);
         RETURN_FALSE;
     }
     if (route.path.empty()) {
@@ -891,6 +966,7 @@ PHP_METHOD(KislayPHPGateway, addServiceRoute) {
     route.target.clear();
     route.service.assign(service, service_len);
     route.use_service = true;
+    route.use_tls = false;
     if (route.path.empty()) {
         route.path = "/";
     }
@@ -924,18 +1000,13 @@ PHP_METHOD(KislayPHPGateway, setThreads) {
         Z_PARAM_LONG(count)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (count < 1) {
-        zend_throw_exception(zend_ce_exception, "Thread count must be >= 1", 0);
-        RETURN_FALSE;
-    }
-
     php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
     if (obj->ctx != nullptr) {
         zend_throw_exception(zend_ce_exception, "Gateway already running", 0);
         RETURN_FALSE;
     }
 
-    obj->thread_count = static_cast<int>(count);
+    obj->thread_count = kislayphp_sanitize_thread_count(static_cast<int>(count), "Kislay\\Gateway\\Gateway::setThreads");
     RETURN_TRUE;
 }
 
@@ -980,6 +1051,8 @@ PHP_METHOD(KislayPHPGateway, listen) {
         zend_throw_exception(zend_ce_exception, "Gateway already running", 0);
         RETURN_FALSE;
     }
+    kislayphp_disable_stack_guard_for_nts("Kislay\\Gateway\\Gateway::listen");
+    obj->thread_count = kislayphp_sanitize_thread_count(obj->thread_count, "Kislay\\Gateway\\Gateway::listen");
 
     std::string listen_addr = std::string(host, host_len) + ":" + std::to_string(port);
     std::vector<const char *> options;
@@ -1017,8 +1090,9 @@ PHP_METHOD(KislayPHPGateway, setFallbackTarget) {
     route.path = "*";
     route.target.assign(target, target_len);
     route.use_service = false;
+    route.use_tls = false;
     if (!kislayphp_parse_target(route.target, route)) {
-        zend_throw_exception(zend_ce_exception, "Invalid fallback target (expected http://host:port)", 0);
+        zend_throw_exception(zend_ce_exception, "Invalid fallback target (expected http(s)://host[:port][/base])", 0);
         RETURN_FALSE;
     }
 
@@ -1042,6 +1116,7 @@ PHP_METHOD(KislayPHPGateway, setFallbackService) {
     route.target.clear();
     route.service.assign(service, service_len);
     route.use_service = true;
+    route.use_tls = false;
 
     std::lock_guard<std::mutex> guard(obj->lock);
     obj->fallback_route = route;
@@ -1074,9 +1149,13 @@ static const zend_function_entry kislayphp_gateway_methods[] = {
 };
 
 PHP_MINIT_FUNCTION(kislayphp_gateway) {
+    if (mg_init_library(MG_FEATURES_DEFAULT | MG_FEATURES_TLS) == 0) {
+        php_error_docref(nullptr, E_WARNING, "Failed to initialize civetweb TLS library features");
+    }
     zend_class_entry ce;
-    INIT_NS_CLASS_ENTRY(ce, "KislayPHP\\Gateway", "Gateway", kislayphp_gateway_methods);
+    INIT_NS_CLASS_ENTRY(ce, "Kislay\\Gateway", "Gateway", kislayphp_gateway_methods);
     kislayphp_gateway_ce = zend_register_internal_class(&ce);
+    zend_register_class_alias("KislayPHP\\Gateway\\Gateway", kislayphp_gateway_ce);
     kislayphp_gateway_ce->create_object = kislayphp_gateway_create_object;
     std::memcpy(&kislayphp_gateway_handlers, zend_get_std_object_handlers(), sizeof(zend_object_handlers));
     kislayphp_gateway_handlers.offset = XtOffsetOf(php_kislayphp_gateway_t, std);
@@ -1085,6 +1164,7 @@ PHP_MINIT_FUNCTION(kislayphp_gateway) {
 }
 
 PHP_MSHUTDOWN_FUNCTION(kislayphp_gateway) {
+    mg_exit_library();
     return SUCCESS;
 }
 

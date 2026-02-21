@@ -1,8 +1,9 @@
 # kislayphp_gateway tests
 
-Run with the gateway extension loaded:
+Run from repository root:
 
 ```sh
-PHP_EXTS="-d extension=kislayphp_gateway/modules/kislayphp_gateway.so"
-php $PHP_EXTS kislayphp_gateway/tests/body_limit_test.php
+make test
 ```
+
+This runs all `.phpt` cases in `tests/`, including namespace alias and HTTPS target parsing coverage.
