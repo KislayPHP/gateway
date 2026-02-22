@@ -143,3 +143,9 @@ make test
 - Route matching is insertion-order and first-match wins.
 - Wildcard path matching is suffix `*` prefix matching (example: `/api/*`).
 - `listen()` is non-blocking; keep your script alive if needed.
+
+## End-to-End Example
+
+A complete distributed content backend example (registry + gateway + docs/blog/community/auth services) is available in:
+
+- `../kislayphp_discovery/examples/website_backend/README.md`
