@@ -283,22 +283,19 @@ static bool kislayphp_has_prefix(const std::string &value, const std::string &pr
 }
 
 static std::string kislayphp_client_identifier(const struct mg_request_info *info) {
-    const char *xff = kislayphp_get_header(info, "X-Forwarded-For");
-    if (xff != nullptr && *xff != '\0') {
-        std::string value(xff);
-        size_t comma = value.find(',');
+    const char *forwarded = kislayphp_get_header(info, "X-Forwarded-For");
+    if (forwarded != nullptr && *forwarded != '\0') {
+        std::string s = forwarded;
+        size_t comma = s.find(',');
         if (comma != std::string::npos) {
-            value = value.substr(0, comma);
+            return kislayphp_trim(s.substr(0, comma));
         }
-        value = kislayphp_trim(value);
-        if (!value.empty()) {
-            return value;
-        }
+        return kislayphp_trim(s);
     }
-    if (info != nullptr && *(info->remote_addr) != '\0') {
+    if (info->remote_addr != nullptr) {
         return std::string(info->remote_addr);
     }
-    return std::string("unknown");
+    return "unknown";
 }
 
 static inline php_kislayphp_gateway_t *php_kislayphp_gateway_from_obj(zend_object *obj) {
@@ -567,9 +564,14 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
 
     std::string method = info->request_method ? info->request_method : "GET";
-    mg_printf(target, "%s %s HTTP/1.0\r\n", method.c_str(), target_path.c_str());
+    mg_printf(target, "%s %s HTTP/1.1\r\n", method.c_str(), target_path.c_str());
     mg_printf(target, "Host: %s:%d\r\n", route.host.c_str(), route.port);
     mg_printf(target, "Connection: close\r\n");
+
+    // X-Forwarded Headers
+    mg_printf(target, "X-Forwarded-For: %s\r\n", kislayphp_client_identifier(info).c_str());
+    mg_printf(target, "X-Forwarded-Proto: %s\r\n", route.use_tls ? "https" : "http");
+    mg_printf(target, "X-Forwarded-Host: %s\r\n", info->http_headers[0].value ? info->http_headers[0].value : "unknown");
 
     bool has_content_length = false;
     for (int i = 0; i < info->num_headers; ++i) {
@@ -578,7 +580,11 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         if (name == nullptr || value == nullptr) {
             continue;
         }
-        if (::strcasecmp(name, "Host") == 0 || kislayphp_is_hop_header(name)) {
+        if (::strcasecmp(name, "Host") == 0 || 
+            ::strcasecmp(name, "X-Forwarded-For") == 0 ||
+            ::strcasecmp(name, "X-Forwarded-Proto") == 0 ||
+            ::strcasecmp(name, "X-Forwarded-Host") == 0 ||
+            kislayphp_is_hop_header(name)) {
             continue;
         }
         if (::strcasecmp(name, "Content-Length") == 0) {
@@ -592,18 +598,16 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
     mg_printf(target, "\r\n");
 
+    // Chunked Body Proxying (Streaming)
     if (info->content_length > 0) {
-        std::vector<char> body(static_cast<size_t>(info->content_length));
-        size_t read_total = 0;
-        while (read_total < body.size()) {
-            int read_now = mg_read(conn, body.data() + read_total, body.size() - read_total);
-            if (read_now <= 0) {
-                break;
-            }
-            read_total += static_cast<size_t>(read_now);
-        }
-        if (read_total > 0) {
-            mg_write(target, body.data(), read_total);
+        char buffer[8192];
+        long long remaining = info->content_length;
+        while (remaining > 0) {
+            int to_read = remaining > (long long)sizeof(buffer) ? (int)sizeof(buffer) : (int)remaining;
+            int read_now = mg_read(conn, buffer, to_read);
+            if (read_now <= 0) break;
+            mg_write(target, buffer, (size_t)read_now);
+            remaining -= read_now;
         }
     }
 
@@ -646,7 +650,7 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
     mg_printf(conn, "Connection: close\r\n\r\n");
 
-    char buffer[4096];
+    char buffer[8192];
     int read_len = 0;
     while ((read_len = mg_read(target, buffer, sizeof(buffer))) > 0) {
         mg_write(conn, buffer, static_cast<size_t>(read_len));
