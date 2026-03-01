@@ -4,7 +4,7 @@ PHP extension for lightweight API gateway and reverse proxy features.
 
 ## Version
 
-Current package line: `v0.0.1`.
+Current package line: `v0.0.3`.
 
 ## Namespace
 
@@ -18,7 +18,7 @@ Both names map to the same class.
 Via PIE:
 
 ```bash
-pie install kislayphp/gateway
+pie install kislayphp/gateway:0.0.3
 ```
 
 Enable in `php.ini`:

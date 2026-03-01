@@ -14,17 +14,17 @@
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-02-21</date>
+  <date>2026-03-01</date>
   <version>
-    <release>0.0.1</release>
-    <api>0.0.1</api>
+    <release>0.0.3</release>
+    <api>0.0.3</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Added Kislay namespace support with compatibility aliases, HTTPS upstream target parsing, and NTS-safe thread fallback.</notes>
+  <notes>Release 0.0.3: fixed runtime version metadata mismatch and always exported get_module for reliable PIE dynamic loading.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />
