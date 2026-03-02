@@ -2,6 +2,12 @@
 
 PHP extension for lightweight API gateway and reverse proxy features.
 
+## Concurrency Mode
+
+- Gateway runtime is event-driven and optimized for concurrent proxying.
+- Public PHP methods are control/config methods with immediate return values.
+- This module is part of the async/event-driven runtime set (with core and eventbus).
+
 ## Version
 
 Current package line: `v0.0.3`.
@@ -49,8 +55,8 @@ $gateway->listen('0.0.0.0', 9008);
 ## Documentation
 
 - Basic docs remain in this repository.
-- Full detailed docs are maintained on the site: [https://skelves.com/docs](https://skelves.com/docs)
-- Local docs route: `http://localhost:5180/docs`
+- Full detailed docs are maintained on the site: [https://skelves.com/kislayphp/docs](https://skelves.com/kislayphp/docs)
+- Local docs route: `http://localhost:5180/kislayphp/docs`
 
 Supported upstream target formats:
 

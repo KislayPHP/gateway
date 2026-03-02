@@ -6,7 +6,7 @@ Current release line is `v0.0.x`.
 
 - Start from `v0.0.1`.
 - Keep incrementing patch while APIs are stabilizing.
-- Do not cut `1.0.0` until namespace/API and runtime behavior are finalized.
+- Do not cut a stable release until namespace/API and runtime behavior are finalized.
 
 ## Pre-publish checks
 

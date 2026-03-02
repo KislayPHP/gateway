@@ -802,6 +802,8 @@ RANLIB
 AR
 ECHO
 LN_S
+GRPC_LIBS
+GRPC_CFLAGS
 OPENSSL_LIBS
 OPENSSL_CFLAGS
 CXXCPP
@@ -910,7 +912,9 @@ CXXFLAGS
 CCC
 CXXCPP
 OPENSSL_CFLAGS
-OPENSSL_LIBS'
+OPENSSL_LIBS
+GRPC_CFLAGS
+GRPC_LIBS'
 
 
 # Initialize some variables set by options.
@@ -1572,6 +1576,8 @@ Some influential environment variables:
               C compiler flags for OPENSSL, overriding pkg-config
   OPENSSL_LIBS
               linker flags for OPENSSL, overriding pkg-config
+  GRPC_CFLAGS C compiler flags for GRPC, overriding pkg-config
+  GRPC_LIBS   linker flags for GRPC, overriding pkg-config
 
 Use these variables to override the choices made by 'configure' or to help
 it to find libraries and programs with nonstandard names/locations.
@@ -5583,10 +5589,10 @@ ac_compiler_gnu=$ac_cv_c_compiler_gnu
 fi
 
 
-  CIVETWEB_INCLUDE_DIR=`pwd`/../https/third_party/civetweb/include
+  CIVETWEB_INCLUDE_DIR=`pwd`/third_party/civetweb/include
 
 for include_path in $CIVETWEB_INCLUDE_DIR; do
-  if test "$include_path" != "$PHP_OS_SDKPATH/usr/include"
+  if test "$include_path" != "/usr/include"
 then :
 
 
@@ -5596,7 +5602,11 @@ then :
 
     ep_dir=$(echo $include_path|$SED 's%/*[^/][^/]*/*$%%')
 
-    ep_realdir=$(cd "$ep_dir" && pwd)
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
     ai_p="$ep_realdir"/$(basename "$include_path")
   fi
 
@@ -5713,7 +5723,7 @@ fi
       ac_ii=$(echo $ac_i|cut -c 3-)
 
 for include_path in $ac_ii; do
-  if test "$include_path" != "$PHP_OS_SDKPATH/usr/include"
+  if test "$include_path" != "/usr/include"
 then :
 
 
@@ -5723,7 +5733,11 @@ then :
 
     ep_dir=$(echo $include_path|$SED 's%/*[^/][^/]*/*$%%')
 
-    ep_realdir=$(cd "$ep_dir" && pwd)
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
     ai_p="$ep_realdir"/$(basename "$include_path")
   fi
 
@@ -5810,7 +5824,7 @@ fi
 
         ac_ii=$(echo $ac_i|cut -c 3-)
 
-  if test "$ac_ii" != "$PHP_OS_SDKPATH/usr/$PHP_LIBDIR" && test "$ac_ii" != "/usr/lib"; then
+  if test "$ac_ii" != "/usr/$PHP_LIBDIR" && test "$ac_ii" != "/usr/lib"; then
 
   if test -z "$ac_ii" || echo "$ac_ii" | grep '^/' >/dev/null ; then
     ai_p=$ac_ii
@@ -5818,7 +5832,11 @@ fi
 
     ep_dir=$(echo $ac_ii|$SED 's%/*[^/][^/]*/*$%%')
 
-    ep_realdir=$(cd "$ep_dir" && pwd)
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
     ai_p="$ep_realdir"/$(basename "$ac_ii")
   fi
 
@@ -5854,8 +5872,357 @@ esac
   done
 
 
+
+  case stdc++ in
+  c|c_r) ;;
+  *)
+    if test "$ext_shared" = "yes"; then
+        KISLAYPHP_GATEWAY_SHARED_LIBADD="-lstdc++ $KISLAYPHP_GATEWAY_SHARED_LIBADD"
+    else
+
+
+  case stdc++ in
+  c|c_r) ;;
+  *)
+      LIBS="-lstdc++ $LIBS"
+   ;;
+  esac
+
+
+    fi
+   ;;
+  esac
+
+
+
+  PHP_VAR_SUBST="$PHP_VAR_SUBST KISLAYPHP_GATEWAY_SHARED_LIBADD"
+
+
   CFLAGS="$CFLAGS -DOPENSSL_API_3_0"
   CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0"
+  if test -f ../rpc/gen/discovery.pb.cc; then
+    RPC_GEN_DIR=`pwd`/../rpc/gen
+
+for include_path in $RPC_GEN_DIR; do
+  if test "$include_path" != "/usr/include"
+then :
+
+
+  if test -z "$include_path" || echo "$include_path" | grep '^/' >/dev/null ; then
+    ai_p=$include_path
+  else
+
+    ep_dir=$(echo $include_path|$SED 's%/*[^/][^/]*/*$%%')
+
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
+    ai_p="$ep_realdir"/$(basename "$include_path")
+  fi
+
+
+
+  unique=$(echo $ai_p|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$INCLUDEPATH$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "INCLUDEPATH$unique=set"
+    INCLUDES="$INCLUDES -I$ai_p"
+  fi
+
+
+fi
+done
+
+
+for include_path in `pwd`/../rpc; do
+  if test "$include_path" != "/usr/include"
+then :
+
+
+  if test -z "$include_path" || echo "$include_path" | grep '^/' >/dev/null ; then
+    ai_p=$include_path
+  else
+
+    ep_dir=$(echo $include_path|$SED 's%/*[^/][^/]*/*$%%')
+
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
+    ai_p="$ep_realdir"/$(basename "$include_path")
+  fi
+
+
+
+  unique=$(echo $ai_p|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$INCLUDEPATH$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "INCLUDEPATH$unique=set"
+    INCLUDES="$INCLUDES -I$ai_p"
+  fi
+
+
+fi
+done
+
+
+pkg_failed=no
+{ printf "%s\n" "$as_me:${as_lineno-$LINENO}: checking for grpc++" >&5
+printf %s "checking for grpc++... " >&6; }
+
+if test -n "$GRPC_CFLAGS"; then
+    pkg_cv_GRPC_CFLAGS="$GRPC_CFLAGS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"grpc++\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "grpc++") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_GRPC_CFLAGS=`$PKG_CONFIG --cflags "grpc++" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+if test -n "$GRPC_LIBS"; then
+    pkg_cv_GRPC_LIBS="$GRPC_LIBS"
+ elif test -n "$PKG_CONFIG"; then
+    if test -n "$PKG_CONFIG" && \
+    { { printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"grpc++\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "grpc++") 2>&5
+  ac_status=$?
+  printf "%s\n" "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
+  test $ac_status = 0; }; then
+  pkg_cv_GRPC_LIBS=`$PKG_CONFIG --libs "grpc++" 2>/dev/null`
+		      test "x$?" != "x0" && pkg_failed=yes
+else
+  pkg_failed=yes
+fi
+ else
+    pkg_failed=untried
+fi
+
+
+
+if test $pkg_failed = yes; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+
+if $PKG_CONFIG --atleast-pkgconfig-version 0.20; then
+        _pkg_short_errors_supported=yes
+else
+        _pkg_short_errors_supported=no
+fi
+        if test $_pkg_short_errors_supported = yes; then
+	        GRPC_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "grpc++" 2>&1`
+        else
+	        GRPC_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "grpc++" 2>&1`
+        fi
+	# Put the nasty error message in config.log where it belongs
+	echo "$GRPC_PKG_ERRORS" >&5
+
+	as_fn_error $? "Package requirements (grpc++) were not met:
+
+$GRPC_PKG_ERRORS
+
+Consider adjusting the PKG_CONFIG_PATH environment variable if you
+installed software in a non-standard prefix.
+
+Alternatively, you may set the environment variables GRPC_CFLAGS
+and GRPC_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details." "$LINENO" 5
+elif test $pkg_failed = untried; then
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: no" >&5
+printf "%s\n" "no" >&6; }
+	{ { printf "%s\n" "$as_me:${as_lineno-$LINENO}: error: in '$ac_pwd':" >&5
+printf "%s\n" "$as_me: error: in '$ac_pwd':" >&2;}
+as_fn_error $? "The pkg-config script could not be found or is too old.  Make sure it
+is in your PATH or set the PKG_CONFIG environment variable to the full
+path to pkg-config.
+
+Alternatively, you may set the environment variables GRPC_CFLAGS
+and GRPC_LIBS to avoid the need to call pkg-config.
+See the pkg-config man page for more details.
+
+To get pkg-config, see <http://pkg-config.freedesktop.org/>.
+See 'config.log' for more details" "$LINENO" 5; }
+else
+	GRPC_CFLAGS=$pkg_cv_GRPC_CFLAGS
+	GRPC_LIBS=$pkg_cv_GRPC_LIBS
+        { printf "%s\n" "$as_me:${as_lineno-$LINENO}: result: yes" >&5
+printf "%s\n" "yes" >&6; }
+
+fi
+
+  for ac_i in $GRPC_CFLAGS; do
+    case $ac_i in
+    -I*)
+      ac_ii=$(echo $ac_i|cut -c 3-)
+
+for include_path in $ac_ii; do
+  if test "$include_path" != "/usr/include"
+then :
+
+
+  if test -z "$include_path" || echo "$include_path" | grep '^/' >/dev/null ; then
+    ai_p=$include_path
+  else
+
+    ep_dir=$(echo $include_path|$SED 's%/*[^/][^/]*/*$%%')
+
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
+    ai_p="$ep_realdir"/$(basename "$include_path")
+  fi
+
+
+
+  unique=$(echo $ai_p|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$INCLUDEPATH$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "INCLUDEPATH$unique=set"
+    INCLUDES="$INCLUDES -I$ai_p"
+  fi
+
+
+fi
+done
+
+    ;;
+    esac
+  done
+
+
+  for ac_i in $GRPC_LIBS; do
+    case $ac_i in #(
+  -pthread) :
+
+        if test "x$ext_shared" = xyes
+then :
+  KISLAYPHP_GATEWAY_SHARED_LIBADD="$KISLAYPHP_GATEWAY_SHARED_LIBADD -pthread"
+else case e in #(
+  e)
+
+
+  unique=$(echo $ac_i|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$EXTRA_LDFLAGS$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "EXTRA_LDFLAGS$unique=set"
+    EXTRA_LDFLAGS="$EXTRA_LDFLAGS $ac_i"
+  fi
+
+
+
+  unique=$(echo $ac_i|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$EXTRA_LDFLAGS_PROGRAM$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "EXTRA_LDFLAGS_PROGRAM$unique=set"
+    EXTRA_LDFLAGS_PROGRAM="$EXTRA_LDFLAGS_PROGRAM $ac_i"
+  fi
+
+         ;;
+esac
+fi
+       ;; #(
+  -l*) :
+
+        ac_ii=$(echo $ac_i|cut -c 3-)
+
+
+  case $ac_ii in
+  c|c_r) ;;
+  *)
+    if test "$ext_shared" = "yes"; then
+        KISLAYPHP_GATEWAY_SHARED_LIBADD="$KISLAYPHP_GATEWAY_SHARED_LIBADD -l$ac_ii"
+    else
+
+
+  case $ac_ii in
+  c|c_r) ;;
+  *)
+      LIBS="$LIBS -l$ac_ii"
+   ;;
+  esac
+
+
+    fi
+   ;;
+  esac
+
+
+       ;; #(
+  -L*) :
+
+        ac_ii=$(echo $ac_i|cut -c 3-)
+
+  if test "$ac_ii" != "/usr/$PHP_LIBDIR" && test "$ac_ii" != "/usr/lib"; then
+
+  if test -z "$ac_ii" || echo "$ac_ii" | grep '^/' >/dev/null ; then
+    ai_p=$ac_ii
+  else
+
+    ep_dir=$(echo $ac_ii|$SED 's%/*[^/][^/]*/*$%%')
+
+    if test -z $ep_dir ; then
+      ep_realdir=$(pwd)
+    else
+      ep_realdir=$(cd "$ep_dir" && pwd)
+    fi
+    ai_p="$ep_realdir"/$(basename "$ac_ii")
+  fi
+
+
+      if test "$ext_shared" = "yes"; then
+        KISLAYPHP_GATEWAY_SHARED_LIBADD="-L$ai_p $KISLAYPHP_GATEWAY_SHARED_LIBADD"
+        test -n "$ld_runpath_switch" && KISLAYPHP_GATEWAY_SHARED_LIBADD="$ld_runpath_switch$ai_p $KISLAYPHP_GATEWAY_SHARED_LIBADD"
+      else
+
+
+
+  unique=$(echo $ai_p|$SED 's/[^a-zA-Z0-9]/_/g')
+
+  cmd="echo $ac_n \"\$LIBPATH$unique$ac_c\""
+  if test -n "$unique" && test "$(eval $cmd)" = "" ; then
+    eval "LIBPATH$unique=set"
+
+    test -n "$ld_runpath_switch" && LDFLAGS="$LDFLAGS $ld_runpath_switch$ai_p"
+    LDFLAGS="$LDFLAGS -L$ai_p"
+    PHP_RPATHS="$PHP_RPATHS $ai_p"
+
+  fi
+
+
+      fi
+
+  fi
+
+       ;; #(
+  *) :
+     ;;
+esac
+  done
+
+    CXXFLAGS="$CXXFLAGS -DKISLAYPHP_RPC"
+    RPC_SRCS="../rpc/gen/discovery.pb.cc ../rpc/gen/discovery.grpc.pb.cc"
+  else
+    { printf "%s\n" "$as_me:${as_lineno-$LINENO}: WARNING: RPC stubs not found. Building without RPC service resolution support." >&5
+printf "%s\n" "$as_me: WARNING: RPC stubs not found. Building without RPC service resolution support." >&2;}
+    RPC_SRCS=""
+  fi
 
 
   ext_builddir=.
@@ -5886,7 +6253,7 @@ esac
 
 
   old_IFS=$IFS
-  for ac_src in kislayphp_gateway.cpp ../https/third_party/civetweb/src/civetweb.c; do
+  for ac_src in kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $RPC_SRCS; do
 
       IFS=.
       set $ac_src
@@ -5938,7 +6305,7 @@ EOF
 
 
   old_IFS=$IFS
-  for ac_src in kislayphp_gateway.cpp ../https/third_party/civetweb/src/civetweb.c; do
+  for ac_src in kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $RPC_SRCS; do
 
       IFS=.
       set $ac_src
@@ -6021,7 +6388,7 @@ printf "%s\n" "#define COMPILE_DL_KISLAYPHP_GATEWAY 1" >>confdefs.h
 
 
   old_IFS=$IFS
-  for ac_src in kislayphp_gateway.cpp ../https/third_party/civetweb/src/civetweb.c; do
+  for ac_src in kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $RPC_SRCS; do
 
       IFS=.
       set $ac_src
@@ -6070,7 +6437,7 @@ EOF
 
 
   old_IFS=$IFS
-  for ac_src in kislayphp_gateway.cpp ../https/third_party/civetweb/src/civetweb.c; do
+  for ac_src in kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $RPC_SRCS; do
 
       IFS=.
       set $ac_src
@@ -6705,7 +7072,7 @@ ia64-*-hpux*)
   ;;
 *-*-irix6*)
   # Find out which ABI we are using.
-  echo '#line 6708 "configure"' > conftest.$ac_ext
+  echo '#line 7075 "configure"' > conftest.$ac_ext
   if { { eval echo "\"\$as_me\":${as_lineno-$LINENO}: \"$ac_compile\""; } >&5
   (eval $ac_compile) 2>&5
   ac_status=$?
@@ -8216,7 +8583,7 @@ else case e in #(
       LDFLAGS="$LDFLAGS -Wl,-exported_symbols_list,conftest.sym"
 
 cat > conftest.$ac_ext <<EOF
-#line 8219 "configure"
+#line 8586 "configure"
 #include "confdefs.h"
 int main(void) {
 ; return 0; }
@@ -8378,11 +8745,11 @@ else case e in #(
    -e 's:.*FLAGS}\{0,1\} :&$lt_compiler_flag :; t' \
    -e 's: [^ ]*conftest\.: $lt_compiler_flag&:; t' \
    -e 's:$: $lt_compiler_flag:'`
-   (eval echo "\"configure:8381: $lt_compile\"" >&5)
+   (eval echo "\"configure:8748: $lt_compile\"" >&5)
    (eval "$lt_compile" 2>conftest.err)
    ac_status=$?
    cat conftest.err >&5
-   echo "configure:8385: \$? = $ac_status" >&5
+   echo "configure:8752: \$? = $ac_status" >&5
    if (exit $ac_status) && test -s "$ac_outfile"; then
      # The compiler can only warn and ignore the option if not recognized
      # So say no if there are warnings other than the usual output.
@@ -8678,11 +9045,11 @@ else case e in #(
    -e 's:.*FLAGS}\{0,1\} :&$lt_compiler_flag :; t' \
    -e 's: [^ ]*conftest\.: $lt_compiler_flag&:; t' \
    -e 's:$: $lt_compiler_flag:'`
-   (eval echo "\"configure:8681: $lt_compile\"" >&5)
+   (eval echo "\"configure:9048: $lt_compile\"" >&5)
    (eval "$lt_compile" 2>conftest.err)
    ac_status=$?
    cat conftest.err >&5
-   echo "configure:8685: \$? = $ac_status" >&5
+   echo "configure:9052: \$? = $ac_status" >&5
    if (exit $ac_status) && test -s "$ac_outfile"; then
      # The compiler can only warn and ignore the option if not recognized
      # So say no if there are warnings other than the usual output.
@@ -8786,11 +9153,11 @@ else case e in #(
    -e 's:.*FLAGS}\{0,1\} :&$lt_compiler_flag :; t' \
    -e 's: [^ ]*conftest\.: $lt_compiler_flag&:; t' \
    -e 's:$: $lt_compiler_flag:'`
-   (eval echo "\"configure:8789: $lt_compile\"" >&5)
+   (eval echo "\"configure:9156: $lt_compile\"" >&5)
    (eval "$lt_compile" 2>out/conftest.err)
    ac_status=$?
    cat out/conftest.err >&5
-   echo "configure:8793: \$? = $ac_status" >&5
+   echo "configure:9160: \$? = $ac_status" >&5
    if (exit $ac_status) && test -s out/conftest2.$ac_objext
    then
      # The compiler can only warn and ignore the option if not recognized
@@ -9251,7 +9618,7 @@ _LT_EOF
        # Determine the default libpath from the value encoded in an empty executable.
 
 cat > conftest.$ac_ext <<EOF
-#line 9254 "configure"
+#line 9621 "configure"
 #include "confdefs.h"
 int main(void) {
 ; return 0; }
@@ -9293,7 +9660,7 @@ if test -z "$aix_libpath"; then aix_libpath="/usr/lib:/lib"; fi
 	 # Determine the default libpath from the value encoded in an empty executable.
 
 cat > conftest.$ac_ext <<EOF
-#line 9296 "configure"
+#line 9663 "configure"
 #include "confdefs.h"
 int main(void) {
 ; return 0; }
@@ -10874,7 +11241,7 @@ else
   lt_dlunknown=0; lt_dlno_uscore=1; lt_dlneed_uscore=2
   lt_status=$lt_dlunknown
   cat > conftest.$ac_ext <<EOF
-#line 10877 "configure"
+#line 11244 "configure"
 #include "confdefs.h"
 
 #if HAVE_DLFCN_H
@@ -10973,7 +11340,7 @@ else
   lt_dlunknown=0; lt_dlno_uscore=1; lt_dlneed_uscore=2
   lt_status=$lt_dlunknown
   cat > conftest.$ac_ext <<EOF
-#line 10976 "configure"
+#line 11343 "configure"
 #include "confdefs.h"
 
 #if HAVE_DLFCN_H
@@ -12042,7 +12409,7 @@ case $host_os in
       # Determine the default libpath from the value encoded in an empty executable.
 
 cat > conftest.$ac_ext <<EOF
-#line 12045 "configure"
+#line 12412 "configure"
 #include "confdefs.h"
 int main(void) {
 ; return 0; }
@@ -12085,7 +12452,7 @@ if test -z "$aix_libpath"; then aix_libpath="/usr/lib:/lib"; fi
 	# Determine the default libpath from the value encoded in an empty executable.
 
 cat > conftest.$ac_ext <<EOF
-#line 12088 "configure"
+#line 12455 "configure"
 #include "confdefs.h"
 int main(void) {
 ; return 0; }
@@ -13338,11 +13705,11 @@ else case e in #(
    -e 's:.*FLAGS}\{0,1\} :&$lt_compiler_flag :; t' \
    -e 's: [^ ]*conftest\.: $lt_compiler_flag&:; t' \
    -e 's:$: $lt_compiler_flag:'`
-   (eval echo "\"configure:13341: $lt_compile\"" >&5)
+   (eval echo "\"configure:13708: $lt_compile\"" >&5)
    (eval "$lt_compile" 2>conftest.err)
    ac_status=$?
    cat conftest.err >&5
-   echo "configure:13345: \$? = $ac_status" >&5
+   echo "configure:13712: \$? = $ac_status" >&5
    if (exit $ac_status) && test -s "$ac_outfile"; then
      # The compiler can only warn and ignore the option if not recognized
      # So say no if there are warnings other than the usual output.
@@ -13446,11 +13813,11 @@ else case e in #(
    -e 's:.*FLAGS}\{0,1\} :&$lt_compiler_flag :; t' \
    -e 's: [^ ]*conftest\.: $lt_compiler_flag&:; t' \
    -e 's:$: $lt_compiler_flag:'`
-   (eval echo "\"configure:13449: $lt_compile\"" >&5)
+   (eval echo "\"configure:13816: $lt_compile\"" >&5)
    (eval "$lt_compile" 2>out/conftest.err)
    ac_status=$?
    cat out/conftest.err >&5
-   echo "configure:13453: \$? = $ac_status" >&5
+   echo "configure:13820: \$? = $ac_status" >&5
    if (exit $ac_status) && test -s out/conftest2.$ac_objext
    then
      # The compiler can only warn and ignore the option if not recognized
