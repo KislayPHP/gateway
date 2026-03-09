@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php-version: ['8.2', '8.3', '8.4']
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup PHP
+      uses: shivammathur/setup-php@v2
+      with:
+        php-version: ${{ matrix.php-version }}
+        extensions: mbstring, intl
+        tools: phpize, composer
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev zlib1g-dev libcurl4-openssl-dev
+
+    - name: Build extension
+      run: |
+        phpize
+        ./configure --enable-kislayphp_gateway
+        make
+
+    - name: Run tests
+      run: make test
+
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        php-version: ['8.2', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php-version }}
+          extensions: mbstring
+          tools: phpize
+
+      - name: Install Visual C++ Build Tools
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Download PHP SDK Binary Tools
+        shell: pwsh
+        run: |
+          git clone --depth=1 https://github.com/php/php-sdk-binary-tools.git C:\php-sdk
+
+      - name: Build extension (Windows)
+        shell: cmd
+        run: |
+          phpize
+          configure --enable-kislayphp_gateway
+          nmake
+
+      - name: Run tests (Windows)
+        shell: cmd
+        run: nmake test
