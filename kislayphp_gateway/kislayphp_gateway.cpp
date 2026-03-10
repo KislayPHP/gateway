@@ -141,12 +141,11 @@ static std::string kislayphp_env_string(const char *name, const char *fallback) 
 }
 
 static void kislayphp_disable_stack_guard_for_nts(const char *source) {
-#if !defined(ZTS)
     (void) source;
+#if !defined(ZTS) && PHP_VERSION_ID >= 80300
+    /* max_allowed_stack_size / stack_limit added in PHP 8.3 */
     EG(max_allowed_stack_size) = -1;
     EG(stack_limit) = nullptr;
-#else
-    (void) source;
 #endif
 }
 
