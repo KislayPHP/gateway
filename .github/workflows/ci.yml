@@ -53,24 +53,14 @@ jobs:
         with:
           php-version: ${{ matrix.php-version }}
           extensions: mbstring
-          tools: composer
+          tools: phpize, composer
 
       - name: Setup MSBuild
         uses: microsoft/setup-msbuild@v2
 
-      - name: Download PHP SDK Binary Tools
-        shell: pwsh
-        run: |
-          git clone --depth=1 https://github.com/php/php-sdk-binary-tools.git C:\php-sdk
-
       - name: Build extension (Windows)
         shell: pwsh
         run: |
-          $phpArch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-          $sdkBat = "C:\php-sdk\phpsdk-vs17-$phpArch.bat"
-          $buildScript = "cd /d ${{ github.workspace }}`r`nphpize`r`nconfigure --enable-kislayphp_gateway`r`nnmake"
-          $buildScript | Out-File -FilePath C:\build_kislay.bat -Encoding ASCII
-          $proc = Start-Process -FilePath "cmd.exe" `
-            -ArgumentList "/c `"$sdkBat`" -t `"C:\build_kislay.bat`"" `
-            -Wait -PassThru -NoNewWindow
-          exit $proc.ExitCode
+          phpize
+          configure --enable-kislayphp_gateway
+          nmake
