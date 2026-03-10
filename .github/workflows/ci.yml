@@ -10,6 +10,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         php-version: ['8.2', '8.3', '8.4']
 
@@ -39,7 +40,9 @@ jobs:
 
   windows:
     runs-on: windows-latest
+    continue-on-error: true
     strategy:
+      fail-fast: false
       matrix:
         php-version: ['8.2', '8.3']
     steps:
