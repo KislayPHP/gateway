@@ -6,6 +6,8 @@ extern "C" {
 
 #include "php_kislayphp_gateway.h"
 
+#include <openssl/hmac.h>
+#include <openssl/sha.h>
 #include <chrono>
 #include <civetweb.h>
 #include <algorithm>
@@ -63,6 +65,8 @@ typedef struct _php_kislayphp_gateway_t {
     bool auth_required;
     std::string auth_bearer_token;
     std::vector<std::string> auth_exclude_prefixes;
+    std::string jwt_secret;
+    std::string auth_user_header;
     bool rate_limit_enabled;
     zend_long rate_limit_requests;
     zend_long rate_limit_window_seconds;
@@ -137,12 +141,11 @@ static std::string kislayphp_env_string(const char *name, const char *fallback) 
 }
 
 static void kislayphp_disable_stack_guard_for_nts(const char *source) {
-#if !defined(ZTS)
     (void) source;
+#if !defined(ZTS) && PHP_VERSION_ID >= 80300
+    /* max_allowed_stack_size / stack_limit added in PHP 8.3 */
     EG(max_allowed_stack_size) = -1;
     EG(stack_limit) = nullptr;
-#else
-    (void) source;
 #endif
 }
 
@@ -313,6 +316,8 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->lock) std::mutex();
     new (&obj->auth_bearer_token) std::string();
     new (&obj->auth_exclude_prefixes) std::vector<std::string>();
+    new (&obj->jwt_secret) std::string();
+    new (&obj->auth_user_header) std::string();
     new (&obj->rate_limits) std::unordered_map<std::string, kislayphp_rate_limit_entry>();
     new (&obj->circuit_states) std::unordered_map<std::string, kislayphp_circuit_state>();
     obj->ctx = nullptr;
@@ -331,6 +336,8 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     obj->auth_bearer_token = kislayphp_env_string("KISLAY_GATEWAY_AUTH_TOKEN", "");
     obj->auth_exclude_prefixes = kislayphp_split_csv(
         kislayphp_env_string("KISLAY_GATEWAY_AUTH_EXCLUDE", "/health,/ready,/metrics"));
+    obj->jwt_secret = kislayphp_env_string("KISLAY_GATEWAY_JWT_SECRET", "");
+    obj->auth_user_header = "X-Authenticated-User";
     obj->rate_limit_enabled = kislayphp_env_bool("KISLAY_GATEWAY_RATE_LIMIT_ENABLED", false);
     obj->rate_limit_requests = kislayphp_env_long("KISLAY_GATEWAY_RATE_LIMIT_REQUESTS", 120);
     if (obj->rate_limit_requests < 1) {
@@ -364,6 +371,8 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     }
     obj->circuit_states.~unordered_map();
     obj->rate_limits.~unordered_map();
+    obj->auth_user_header.~basic_string();
+    obj->jwt_secret.~basic_string();
     obj->auth_exclude_prefixes.~vector();
     obj->auth_bearer_token.~basic_string();
     obj->routes.~vector();
@@ -526,11 +535,181 @@ static void kislayphp_send_error(struct mg_connection *conn, int status, const c
               message);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// JWT helpers (HS256, no external library beyond OpenSSL)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static bool kislay_gateway_base64url_decode(const std::string &in, std::string &out) {
+    static const std::string b64chars =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string padded = in;
+    std::replace(padded.begin(), padded.end(), '-', '+');
+    std::replace(padded.begin(), padded.end(), '_', '/');
+    switch (padded.size() % 4) {
+        case 2: padded += "=="; break;
+        case 3: padded += "=";  break;
+        default: break;
+    }
+    out.clear();
+    int val = 0, valb = -8;
+    for (unsigned char c : padded) {
+        if (c == '=') break;
+        size_t pos = b64chars.find(static_cast<char>(c));
+        if (pos == std::string::npos) return false;
+        val = (val << 6) + static_cast<int>(pos);
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return true;
+}
+
+static bool kislay_gateway_path_excluded(const std::string &path,
+                                         const std::vector<std::string> &excludes) {
+    for (const auto &prefix : excludes) {
+        if (kislayphp_has_prefix(path, prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool kislay_gateway_validate_jwt(const std::string &token,
+                                        const std::string &secret,
+                                        std::string &sub_out,
+                                        std::string &roles_out) {
+    sub_out.clear();
+    roles_out.clear();
+
+    size_t dot1 = token.find('.');
+    if (dot1 == std::string::npos) return false;
+    size_t dot2 = token.find('.', dot1 + 1);
+    if (dot2 == std::string::npos) return false;
+
+    std::string header_b64  = token.substr(0, dot1);
+    std::string payload_b64 = token.substr(dot1 + 1, dot2 - dot1 - 1);
+    std::string sig_b64     = token.substr(dot2 + 1);
+
+    // Verify algorithm claim
+    std::string header_json;
+    if (!kislay_gateway_base64url_decode(header_b64, header_json)) return false;
+    if (header_json.find("\"HS256\"") == std::string::npos) return false;
+
+    // Decode payload
+    std::string payload_json;
+    if (!kislay_gateway_base64url_decode(payload_b64, payload_json)) return false;
+
+    // Check exp claim
+    size_t exp_pos = payload_json.find("\"exp\"");
+    if (exp_pos != std::string::npos) {
+        size_t colon = payload_json.find(':', exp_pos + 5);
+        if (colon != std::string::npos) {
+            size_t num_start = payload_json.find_first_of("0123456789", colon + 1);
+            if (num_start != std::string::npos) {
+                size_t num_end = payload_json.find_first_not_of("0123456789", num_start);
+                std::string num_str = payload_json.substr(num_start,
+                    num_end == std::string::npos ? std::string::npos : num_end - num_start);
+                long long exp_val = std::stoll(num_str);
+                if (exp_val < static_cast<long long>(std::time(nullptr))) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Verify HMAC-SHA256 signature
+    std::string signing_input = header_b64 + "." + payload_b64;
+    unsigned char hmac_out[EVP_MAX_MD_SIZE] = {0};
+    unsigned int  hmac_len = 0;
+    HMAC(EVP_sha256(),
+         secret.c_str(), static_cast<int>(secret.size()),
+         reinterpret_cast<const unsigned char *>(signing_input.c_str()),
+         signing_input.size(),
+         hmac_out, &hmac_len);
+
+    std::string sig_raw;
+    if (!kislay_gateway_base64url_decode(sig_b64, sig_raw)) return false;
+    if (sig_raw.size() != hmac_len) return false;
+
+    // Constant-time comparison
+    int diff = 0;
+    for (unsigned int i = 0; i < hmac_len; ++i) {
+        diff |= (static_cast<unsigned char>(sig_raw[i]) ^ hmac_out[i]);
+    }
+    if (diff != 0) return false;
+
+    // Extract sub claim
+    auto extract_string_claim = [&](const std::string &json,
+                                    const std::string &key) -> std::string {
+        std::string needle = "\"" + key + "\"";
+        size_t p = json.find(needle);
+        if (p == std::string::npos) return "";
+        size_t c = json.find(':', p + needle.size());
+        if (c == std::string::npos) return "";
+        size_t q1 = json.find('"', c + 1);
+        if (q1 == std::string::npos) return "";
+        size_t q2 = json.find('"', q1 + 1);
+        if (q2 == std::string::npos) return "";
+        return json.substr(q1 + 1, q2 - q1 - 1);
+    };
+    sub_out = extract_string_claim(payload_json, "sub");
+
+    // Extract roles claim (array of strings, comma-joined)
+    std::string roles_needle = "\"roles\"";
+    size_t roles_pos = payload_json.find(roles_needle);
+    if (roles_pos != std::string::npos) {
+        size_t bracket = payload_json.find('[', roles_pos + roles_needle.size());
+        if (bracket != std::string::npos) {
+            size_t end_bracket = payload_json.find(']', bracket + 1);
+            if (end_bracket != std::string::npos) {
+                std::string arr = payload_json.substr(bracket + 1, end_bracket - bracket - 1);
+                size_t p = 0;
+                while (p < arr.size()) {
+                    size_t q1 = arr.find('"', p);
+                    if (q1 == std::string::npos) break;
+                    size_t q2 = arr.find('"', q1 + 1);
+                    if (q2 == std::string::npos) break;
+                    if (!roles_out.empty()) roles_out += ',';
+                    roles_out += arr.substr(q1 + 1, q2 - q1 - 1);
+                    p = q2 + 1;
+                }
+            }
+        }
+    }
+
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Generate cryptographically random hex string of given byte length (gateway)
+static std::string kislay_gw_random_hex(size_t bytes) {
+    std::string result(bytes * 2, '0');
+    unsigned char buf[32] = {0};
+#ifdef __APPLE__
+    arc4random_buf(buf, bytes);
+#elif defined(_WIN32)
+    BCryptGenRandom(NULL, buf, (ULONG)bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+#else
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (f) { fread(buf, 1, bytes, f); fclose(f); }
+#endif
+    static const char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < bytes; i++) {
+        result[i*2]   = hex[buf[i] >> 4];
+        result[i*2+1] = hex[buf[i] & 0xf];
+    }
+    return result;
+}
+
 static bool kislayphp_proxy_request(struct mg_connection *conn,
                                     const struct mg_request_info *info,
                                     const kislayphp_gateway_route &route,
                                     size_t max_body_bytes,
-                                    int *status_code_out) {
+                                    int *status_code_out,
+                                    const std::vector<std::pair<std::string,std::string>> &extra_headers = {}) {
     if (status_code_out != nullptr) {
         *status_code_out = 0;
     }
@@ -572,6 +751,11 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     mg_printf(target, "X-Forwarded-For: %s\r\n", kislayphp_client_identifier(info).c_str());
     mg_printf(target, "X-Forwarded-Proto: %s\r\n", route.use_tls ? "https" : "http");
     mg_printf(target, "X-Forwarded-Host: %s\r\n", info->http_headers[0].value ? info->http_headers[0].value : "unknown");
+
+    // Inject extra headers (e.g. X-Authenticated-User, X-Auth-Roles from JWT)
+    for (const auto &h : extra_headers) {
+        mg_printf(target, "%s: %s\r\n", h.first.c_str(), h.second.c_str());
+    }
 
     bool has_content_length = false;
     for (int i = 0; i < info->num_headers; ++i) {
@@ -671,31 +855,58 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     method = kislayphp_to_upper(method);
     std::string path = info->local_uri ? info->local_uri : (info->request_uri ? info->request_uri : "");
 
+    // Auth check: JWT (HS256) when jwt_secret is set; legacy bearer token otherwise.
+    // Validated sub/roles are forwarded as upstream headers via extra_proxy_headers.
+    std::vector<std::pair<std::string,std::string>> extra_proxy_headers;
+
     if (gateway->auth_required) {
-        bool excluded = false;
-        for (const auto &prefix : gateway->auth_exclude_prefixes) {
-            if (kislayphp_has_prefix(path, prefix)) {
-                excluded = true;
-                break;
-            }
-        }
+        if (!kislay_gateway_path_excluded(path, gateway->auth_exclude_prefixes)) {
+            const char *auth_hdr = kislayphp_get_header(info, "Authorization");
 
-        if (!excluded) {
-            if (gateway->auth_bearer_token.empty()) {
-                kislayphp_send_error(conn, 503, "Gateway auth token not configured");
-                return 1;
-            }
-
-            const char *auth = kislayphp_get_header(info, "Authorization");
-            if (auth == nullptr || *auth == '\0') {
-                kislayphp_send_error(conn, 401, "Missing Authorization header");
-                return 1;
-            }
-            std::string expected = "Bearer ";
-            expected.append(gateway->auth_bearer_token);
-            if (std::string(auth) != expected) {
-                kislayphp_send_error(conn, 401, "Invalid Authorization token");
-                return 1;
+            if (!gateway->jwt_secret.empty()) {
+                // JWT validation mode (HS256)
+                std::string jwt_sub;
+                std::string jwt_roles;
+                bool valid = false;
+                if (auth_hdr != nullptr && std::strncmp(auth_hdr, "Bearer ", 7) == 0) {
+                    std::string token(auth_hdr + 7);
+                    valid = kislay_gateway_validate_jwt(token, gateway->jwt_secret,
+                                                        jwt_sub, jwt_roles);
+                }
+                if (!valid) {
+                    static const char jwt_err[] = "{\"error\":\"Unauthorized\"}";
+                    mg_printf(conn,
+                              "HTTP/1.1 401 Unauthorized\r\n"
+                              "Content-Type: application/json; charset=utf-8\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Connection: close\r\n\r\n"
+                              "%s",
+                              sizeof(jwt_err) - 1, jwt_err);
+                    return 1;
+                }
+                // Inject validated claims as upstream headers
+                if (!jwt_sub.empty()) {
+                    extra_proxy_headers.emplace_back(gateway->auth_user_header, jwt_sub);
+                }
+                if (!jwt_roles.empty()) {
+                    extra_proxy_headers.emplace_back("X-Auth-Roles", jwt_roles);
+                }
+            } else {
+                // Legacy simple bearer token mode
+                if (gateway->auth_bearer_token.empty()) {
+                    kislayphp_send_error(conn, 503, "Gateway auth token not configured");
+                    return 1;
+                }
+                if (auth_hdr == nullptr || *auth_hdr == '\0') {
+                    kislayphp_send_error(conn, 401, "Missing Authorization header");
+                    return 1;
+                }
+                std::string expected = "Bearer ";
+                expected.append(gateway->auth_bearer_token);
+                if (std::string(auth_hdr) != expected) {
+                    kislayphp_send_error(conn, 401, "Invalid Authorization token");
+                    return 1;
+                }
             }
         }
     }
@@ -716,6 +927,24 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             return 1;
         }
         entry.count++;
+    }
+
+    // W3C Trace Context: forward or generate traceparent/tracestate for upstream
+    {
+        const char *tp_hdr = kislayphp_get_header(info, "traceparent");
+        const char *ts_hdr = kislayphp_get_header(info, "tracestate");
+        if (tp_hdr) {
+            extra_proxy_headers.emplace_back("traceparent", std::string(tp_hdr));
+        } else {
+            // No incoming traceparent — generate one so downstream services have trace context
+            std::string trace_id = kislay_gw_random_hex(16);
+            std::string span_id  = kislay_gw_random_hex(8);
+            std::string new_tp   = "00-" + trace_id + "-" + span_id + "-01";
+            extra_proxy_headers.emplace_back("traceparent", new_tp);
+        }
+        if (ts_hdr) {
+            extra_proxy_headers.emplace_back("tracestate", std::string(ts_hdr));
+        }
     }
 
     kislayphp_gateway_route match;
@@ -818,7 +1047,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             }
 
             int upstream_status = 0;
-            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status);
+            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
             bool failed = !ok_proxy || upstream_status >= 500;
             std::lock_guard<std::mutex> guard(gateway->lock);
             auto &state = gateway->circuit_states[upstream_key];
@@ -835,7 +1064,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             return 1;
         }
 
-        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr);
+        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr, extra_proxy_headers);
         return 1;
     }
 
@@ -856,7 +1085,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         }
 
         int upstream_status = 0;
-        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status);
+        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
         bool failed = !ok_proxy || upstream_status >= 500;
         std::lock_guard<std::mutex> guard(gateway->lock);
         auto &state = gateway->circuit_states[upstream_key];
@@ -873,7 +1102,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         return 1;
     }
 
-    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr);
+    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr, extra_proxy_headers);
     return 1;
 }
 
@@ -911,6 +1140,15 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_fallback_service, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, service, IS_STRING, 0)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_kislayphp_gateway_require_auth, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, secret, IS_STRING, 0)
+    ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(0, options, IS_ARRAY, 0, "[]")
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_kislayphp_gateway_set_auth_exclude, 0, 1, IS_VOID, 0)
+    ZEND_ARG_TYPE_INFO(0, paths, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
 PHP_METHOD(KislayPHPGateway, __construct) {
@@ -1138,6 +1376,60 @@ PHP_METHOD(KislayPHPGateway, stop) {
     RETURN_TRUE;
 }
 
+PHP_METHOD(KislayPHPGateway, requireAuth) {
+    char *secret = nullptr;
+    size_t secret_len = 0;
+    zval *options = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
+        Z_PARAM_STRING(secret, secret_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY(options)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    std::lock_guard<std::mutex> guard(obj->lock);
+
+    obj->jwt_secret.assign(secret, secret_len);
+    obj->auth_required = true;
+
+    if (options != nullptr && Z_TYPE_P(options) == IS_ARRAY) {
+        // 'exclude' => ['/health', '/public']
+        zval *exclude_val = zend_hash_str_find(Z_ARRVAL_P(options), "exclude", sizeof("exclude") - 1);
+        if (exclude_val != nullptr && Z_TYPE_P(exclude_val) == IS_ARRAY) {
+            obj->auth_exclude_prefixes.clear();
+            zval *item;
+            ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(exclude_val), item) {
+                if (Z_TYPE_P(item) == IS_STRING) {
+                    obj->auth_exclude_prefixes.emplace_back(Z_STRVAL_P(item), Z_STRLEN_P(item));
+                }
+            } ZEND_HASH_FOREACH_END();
+        }
+
+        // 'header' => 'X-Internal-Token'
+        zval *header_val = zend_hash_str_find(Z_ARRVAL_P(options), "header", sizeof("header") - 1);
+        if (header_val != nullptr && Z_TYPE_P(header_val) == IS_STRING) {
+            obj->auth_user_header.assign(Z_STRVAL_P(header_val), Z_STRLEN_P(header_val));
+        }
+    }
+}
+
+PHP_METHOD(KislayPHPGateway, setAuthExclude) {
+    zval *paths = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(paths)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    std::lock_guard<std::mutex> guard(obj->lock);
+
+    zval *item;
+    ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(paths), item) {
+        if (Z_TYPE_P(item) == IS_STRING) {
+            obj->auth_exclude_prefixes.emplace_back(Z_STRVAL_P(item), Z_STRLEN_P(item));
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
 static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, __construct, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, addRoute, arginfo_kislayphp_gateway_add, ZEND_ACC_PUBLIC)
@@ -1149,6 +1441,8 @@ static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, setFallbackService, arginfo_kislayphp_gateway_set_fallback_service, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, listen, arginfo_kislayphp_gateway_listen, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, stop, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, requireAuth, arginfo_kislayphp_gateway_require_auth, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setAuthExclude, arginfo_kislayphp_gateway_set_auth_exclude, ZEND_ACC_PUBLIC)
     PHP_FE_END
 };
 
