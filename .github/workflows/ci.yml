@@ -67,15 +67,10 @@ jobs:
         shell: pwsh
         run: |
           $phpArch = if ([Environment]::Is64BitOperatingSystem) { "x64" } else { "x86" }
-          $sdkBat  = "C:\php-sdk\phpsdk-vs17-$phpArch.bat"
-          $buildScript = @"
-          cd /d ${{ github.workspace }}
-          phpize
-          configure --enable-kislayphp_gateway
-          nmake
-"@
+          $sdkBat = "C:\php-sdk\phpsdk-vs17-$phpArch.bat"
+          $buildScript = "cd /d ${{ github.workspace }}`r`nphpize`r`nconfigure --enable-kislayphp_gateway`r`nnmake"
           $buildScript | Out-File -FilePath C:\build_kislay.bat -Encoding ASCII
-          $proc = Start-Process -FilePath "cmd.exe" ``
-            -ArgumentList "/c ``"$sdkBat``" -t ``"C:\build_kislay.bat``"" ``
+          $proc = Start-Process -FilePath "cmd.exe" `
+            -ArgumentList "/c `"$sdkBat`" -t `"C:\build_kislay.bat`"" `
             -Wait -PassThru -NoNewWindow
           exit $proc.ExitCode
