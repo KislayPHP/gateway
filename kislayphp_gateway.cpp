@@ -67,6 +67,8 @@ typedef struct _php_kislayphp_gateway_t {
     std::vector<std::string> auth_exclude_prefixes;
     std::string jwt_secret;
     std::string auth_user_header;
+    zend_long proxy_read_timeout_ms;
+    zend_long proxy_retries;
     bool rate_limit_enabled;
     zend_long rate_limit_requests;
     zend_long rate_limit_window_seconds;
@@ -338,6 +340,14 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
         kislayphp_env_string("KISLAY_GATEWAY_AUTH_EXCLUDE", "/health,/ready,/metrics"));
     obj->jwt_secret = kislayphp_env_string("KISLAY_GATEWAY_JWT_SECRET", "");
     obj->auth_user_header = "X-Authenticated-User";
+    obj->proxy_read_timeout_ms = kislayphp_env_long("KISLAY_GATEWAY_READ_TIMEOUT_MS", 10000);
+    if (obj->proxy_read_timeout_ms < 1) {
+        obj->proxy_read_timeout_ms = 10000;
+    }
+    obj->proxy_retries = kislayphp_env_long("KISLAY_GATEWAY_RETRY_IDEMPOTENT", 1);
+    if (obj->proxy_retries < 0) {
+        obj->proxy_retries = 0;
+    }
     obj->rate_limit_enabled = kislayphp_env_bool("KISLAY_GATEWAY_RATE_LIMIT_ENABLED", false);
     obj->rate_limit_requests = kislayphp_env_long("KISLAY_GATEWAY_RATE_LIMIT_REQUESTS", 120);
     if (obj->rate_limit_requests < 1) {
@@ -577,11 +587,7 @@ static bool kislay_gateway_path_excluded(const std::string &path,
 }
 
 static bool kislay_gateway_validate_jwt(const std::string &token,
-                                        const std::string &secret,
-                                        std::string &sub_out,
-                                        std::string &roles_out) {
-    sub_out.clear();
-    roles_out.clear();
+                                        const std::string &secret) {
 
     size_t dot1 = token.find('.');
     if (dot1 == std::string::npos) return false;
@@ -640,45 +646,6 @@ static bool kislay_gateway_validate_jwt(const std::string &token,
     }
     if (diff != 0) return false;
 
-    // Extract sub claim
-    auto extract_string_claim = [&](const std::string &json,
-                                    const std::string &key) -> std::string {
-        std::string needle = "\"" + key + "\"";
-        size_t p = json.find(needle);
-        if (p == std::string::npos) return "";
-        size_t c = json.find(':', p + needle.size());
-        if (c == std::string::npos) return "";
-        size_t q1 = json.find('"', c + 1);
-        if (q1 == std::string::npos) return "";
-        size_t q2 = json.find('"', q1 + 1);
-        if (q2 == std::string::npos) return "";
-        return json.substr(q1 + 1, q2 - q1 - 1);
-    };
-    sub_out = extract_string_claim(payload_json, "sub");
-
-    // Extract roles claim (array of strings, comma-joined)
-    std::string roles_needle = "\"roles\"";
-    size_t roles_pos = payload_json.find(roles_needle);
-    if (roles_pos != std::string::npos) {
-        size_t bracket = payload_json.find('[', roles_pos + roles_needle.size());
-        if (bracket != std::string::npos) {
-            size_t end_bracket = payload_json.find(']', bracket + 1);
-            if (end_bracket != std::string::npos) {
-                std::string arr = payload_json.substr(bracket + 1, end_bracket - bracket - 1);
-                size_t p = 0;
-                while (p < arr.size()) {
-                    size_t q1 = arr.find('"', p);
-                    if (q1 == std::string::npos) break;
-                    size_t q2 = arr.find('"', q1 + 1);
-                    if (q2 == std::string::npos) break;
-                    if (!roles_out.empty()) roles_out += ',';
-                    roles_out += arr.substr(q1 + 1, q2 - q1 - 1);
-                    p = q2 + 1;
-                }
-            }
-        }
-    }
-
     return true;
 }
 
@@ -704,17 +671,25 @@ static std::string kislay_gw_random_hex(size_t bytes) {
     return result;
 }
 
+static bool kislayphp_gateway_is_idempotent_method(const std::string &method) {
+    return method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "PUT" || method == "DELETE";
+}
+
 static bool kislayphp_proxy_request(struct mg_connection *conn,
                                     const struct mg_request_info *info,
                                     const kislayphp_gateway_route &route,
                                     size_t max_body_bytes,
+                                    zend_long read_timeout_ms,
                                     int *status_code_out,
-                                    const std::vector<std::pair<std::string,std::string>> &extra_headers = {}) {
+                                    const std::vector<std::pair<std::string,std::string>> &extra_headers = {},
+                                    bool write_error_response = true) {
     if (status_code_out != nullptr) {
         *status_code_out = 0;
     }
     if (max_body_bytes > 0 && info->content_length > static_cast<long long>(max_body_bytes)) {
-        kislayphp_send_error(conn, 413, "Payload Too Large");
+        if (write_error_response) {
+            kislayphp_send_error(conn, 413, "Payload Too Large");
+        }
         if (status_code_out != nullptr) {
             *status_code_out = 413;
         }
@@ -728,7 +703,9 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
                          route.host.c_str(),
                          route.port,
                          error_buf[0] != '\0' ? error_buf : "unknown error");
-        kislayphp_send_error(conn, 502, "Upstream connect failed");
+        if (write_error_response) {
+            kislayphp_send_error(conn, 502, "Upstream connect failed");
+        }
         if (status_code_out != nullptr) {
             *status_code_out = 502;
         }
@@ -795,9 +772,12 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         }
     }
 
-    if (mg_get_response(target, error_buf, sizeof(error_buf), 10000) < 0) {
+    int response_timeout = static_cast<int>(read_timeout_ms > 0 ? read_timeout_ms : 10000);
+    if (mg_get_response(target, error_buf, sizeof(error_buf), response_timeout) < 0) {
         mg_close_connection(target);
-        kislayphp_send_error(conn, 502, "Upstream response failed");
+        if (write_error_response) {
+            kislayphp_send_error(conn, 502, "Upstream response failed");
+        }
         if (status_code_out != nullptr) {
             *status_code_out = 502;
         }
@@ -813,6 +793,7 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
 
     bool resp_has_length = false;
+    bool resp_has_request_id = false;
     if (resp_info) {
         for (int i = 0; i < resp_info->num_headers; ++i) {
             const char *name = resp_info->http_headers[i].name;
@@ -826,10 +807,21 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
             if (::strcasecmp(name, "Content-Length") == 0) {
                 resp_has_length = true;
             }
+            if (::strcasecmp(name, "X-Request-ID") == 0) {
+                resp_has_request_id = true;
+            }
             mg_printf(conn, "%s: %s\r\n", name, value);
         }
         if (!resp_has_length && resp_info->content_length >= 0) {
             mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
+        }
+    }
+    if (!resp_has_request_id) {
+        for (const auto &header : extra_headers) {
+            if (::strcasecmp(header.first.c_str(), "X-Request-ID") == 0) {
+                mg_printf(conn, "X-Request-ID: %s\r\n", header.second.c_str());
+                break;
+            }
         }
     }
     mg_printf(conn, "Connection: close\r\n\r\n");
@@ -844,6 +836,43 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     return true;
 }
 
+static bool kislayphp_gateway_proxy_with_resilience(struct mg_connection *conn,
+                                                    const struct mg_request_info *info,
+                                                    const kislayphp_gateway_route &route,
+                                                    const php_kislayphp_gateway_t *gateway,
+                                                    const std::vector<std::pair<std::string,std::string>> &extra_headers,
+                                                    int *status_code_out) {
+    std::string method = info->request_method ? kislayphp_to_upper(info->request_method) : "GET";
+    zend_long retries = kislayphp_gateway_is_idempotent_method(method) ? gateway->proxy_retries : 0;
+    if (retries < 0) {
+        retries = 0;
+    }
+
+    for (zend_long attempt = 0; attempt <= retries; ++attempt) {
+        bool final_attempt = attempt == retries;
+        int attempt_status = 0;
+        bool ok = kislayphp_proxy_request(conn,
+                                          info,
+                                          route,
+                                          gateway->max_body_bytes,
+                                          gateway->proxy_read_timeout_ms,
+                                          &attempt_status,
+                                          extra_headers,
+                                          final_attempt);
+        if (status_code_out != nullptr) {
+            *status_code_out = attempt_status;
+        }
+        if (ok) {
+            return true;
+        }
+        if (attempt_status != 502 || final_attempt) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
 static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     const struct mg_request_info *info = mg_get_request_info(conn);
     if (info == nullptr || info->user_data == nullptr) {
@@ -855,8 +884,9 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     method = kislayphp_to_upper(method);
     std::string path = info->local_uri ? info->local_uri : (info->request_uri ? info->request_uri : "");
 
-    // Auth check: JWT (HS256) when jwt_secret is set; legacy bearer token otherwise.
-    // Validated sub/roles are forwarded as upstream headers via extra_proxy_headers.
+    // Auth check stays at the edge, but auth state itself belongs to Core.
+    // Gateway validates presence/signature when configured and forwards the original
+    // Authorization header downstream without synthesizing identity headers.
     std::vector<std::pair<std::string,std::string>> extra_proxy_headers;
 
     if (gateway->auth_required) {
@@ -864,14 +894,10 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             const char *auth_hdr = kislayphp_get_header(info, "Authorization");
 
             if (!gateway->jwt_secret.empty()) {
-                // JWT validation mode (HS256)
-                std::string jwt_sub;
-                std::string jwt_roles;
                 bool valid = false;
                 if (auth_hdr != nullptr && std::strncmp(auth_hdr, "Bearer ", 7) == 0) {
                     std::string token(auth_hdr + 7);
-                    valid = kislay_gateway_validate_jwt(token, gateway->jwt_secret,
-                                                        jwt_sub, jwt_roles);
+                    valid = kislay_gateway_validate_jwt(token, gateway->jwt_secret);
                 }
                 if (!valid) {
                     static const char jwt_err[] = "{\"error\":\"Unauthorized\"}";
@@ -883,13 +909,6 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                               "%s",
                               sizeof(jwt_err) - 1, jwt_err);
                     return 1;
-                }
-                // Inject validated claims as upstream headers
-                if (!jwt_sub.empty()) {
-                    extra_proxy_headers.emplace_back(gateway->auth_user_header, jwt_sub);
-                }
-                if (!jwt_roles.empty()) {
-                    extra_proxy_headers.emplace_back("X-Auth-Roles", jwt_roles);
                 }
             } else {
                 // Legacy simple bearer token mode
@@ -929,21 +948,12 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         entry.count++;
     }
 
-    // W3C Trace Context: forward or generate traceparent/tracestate for upstream
+    // Preserve the request identifier end-to-end. Core will continue using the same
+    // value and emit it back if present.
     {
-        const char *tp_hdr = kislayphp_get_header(info, "traceparent");
-        const char *ts_hdr = kislayphp_get_header(info, "tracestate");
-        if (tp_hdr) {
-            extra_proxy_headers.emplace_back("traceparent", std::string(tp_hdr));
-        } else {
-            // No incoming traceparent — generate one so downstream services have trace context
-            std::string trace_id = kislay_gw_random_hex(16);
-            std::string span_id  = kislay_gw_random_hex(8);
-            std::string new_tp   = "00-" + trace_id + "-" + span_id + "-01";
-            extra_proxy_headers.emplace_back("traceparent", new_tp);
-        }
-        if (ts_hdr) {
-            extra_proxy_headers.emplace_back("tracestate", std::string(ts_hdr));
+        const char *request_id_hdr = kislayphp_get_header(info, "X-Request-ID");
+        if (request_id_hdr == nullptr || *request_id_hdr == '\0') {
+            extra_proxy_headers.emplace_back("X-Request-ID", kislay_gw_random_hex(16));
         }
     }
 
@@ -1047,7 +1057,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             }
 
             int upstream_status = 0;
-            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
+            bool ok_proxy = kislayphp_gateway_proxy_with_resilience(conn, info, resolved, gateway, extra_proxy_headers, &upstream_status);
             bool failed = !ok_proxy || upstream_status >= 500;
             std::lock_guard<std::mutex> guard(gateway->lock);
             auto &state = gateway->circuit_states[upstream_key];
@@ -1064,7 +1074,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             return 1;
         }
 
-        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr, extra_proxy_headers);
+        kislayphp_gateway_proxy_with_resilience(conn, info, resolved, gateway, extra_proxy_headers, nullptr);
         return 1;
     }
 
@@ -1085,7 +1095,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         }
 
         int upstream_status = 0;
-        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
+        bool ok_proxy = kislayphp_gateway_proxy_with_resilience(conn, info, match, gateway, extra_proxy_headers, &upstream_status);
         bool failed = !ok_proxy || upstream_status >= 500;
         std::lock_guard<std::mutex> guard(gateway->lock);
         auto &state = gateway->circuit_states[upstream_key];
@@ -1102,7 +1112,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         return 1;
     }
 
-    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr, extra_proxy_headers);
+    kislayphp_gateway_proxy_with_resilience(conn, info, match, gateway, extra_proxy_headers, nullptr);
     return 1;
 }
 

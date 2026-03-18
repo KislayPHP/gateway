@@ -2,281 +2,132 @@
 
 ## Overview
 
-`kislayphp_gateway` exposes a single gateway server class implemented in C++.
+`kislayphp_gateway` is the edge layer for KislayPHP deployments.
 
-Namespace:
+Use it to:
+- match HTTP routes
+- resolve service targets
+- apply lightweight edge auth
+- rate limit
+- trip a simple circuit breaker
+- forward requests to Core services or upstream HTTP targets
+
+Do not use it to duplicate:
+- Core JWT state
+- Core tracing state
+- Core async HTTP execution
+- business logic
+
+## Namespace
 
 - Primary: `Kislay\Gateway\Gateway`
 - Legacy alias: `KislayPHP\Gateway\Gateway`
 
-## Class: `Kislay\Gateway\Gateway`
+## Public API
 
-### Constructor
+### `addRoute(string $method, string $path, string $target): bool`
+Direct upstream route.
 
-```php
-new Kislay\Gateway\Gateway()
-```
+### `addServiceRoute(string $method, string $path, string $service): bool`
+Logical service route resolved at request time.
 
-Loads runtime defaults from environment variables.
-
-### `addRoute`
-
-```php
-addRoute(string $method, string $path, string $target): bool
-```
-
-Adds a direct upstream route.
-
-- `method` is normalized to uppercase.
-- `path` may be exact (`/health`) or wildcard suffix (`/api/*`).
-- `target` must be `http(s)://host[:port][/base]`.
-- Throws exception on invalid target.
-
-### `addServiceRoute`
-
-```php
-addServiceRoute(string $method, string $path, string $service): bool
-```
-
-Adds a service-name route. Service name must be resolved later by:
-
-- `setResolver(callable)`; or
-- optional RPC resolver mode (`KISLAY_RPC_ENABLED=1`, if compiled with RPC support).
-
-### `routes`
-
-```php
-routes(): array
-```
-
-Returns configured routes. Each item includes:
-
-- direct route: `method`, `path`, `target`
-- service route: `method`, `path`, `service`
-
-### `setThreads`
-
-```php
-setThreads(int $count): bool
-```
-
-Sets CivetWeb worker thread count before `listen()`.
-
-- Throws if gateway is already running.
-- `count < 1` is sanitized to `1` with warning.
-- On NTS PHP builds (Thread Safety disabled), values `>1` are forced to `1` with warning.
-
-### `setResolver`
-
-```php
-setResolver(callable $resolver): bool
-```
-
-Sets PHP callback for service routes.
-
-Callback signature:
+### `setResolver(callable $resolver): bool`
+Resolver signature:
 
 ```php
 function (string $service, string $method, string $path): string
 ```
 
-Return must be an upstream target string (`http://...` or `https://...`).
+### `listen(string $host, int $port): bool`
+Starts the gateway listener and returns after startup.
 
-### `setFallbackTarget`
+### `stop(): bool`
+Stops the listener.
 
-```php
-setFallbackTarget(string $target): bool
-```
+## Request / Trace / Auth Flow
 
-Sets default upstream used when no route matches.
+Gateway preserves the Core contract.
 
-### `setFallbackService`
+### Request ID
+- forwards incoming `X-Request-ID`
+- generates one only if missing
+- returns the same request ID in the response path
 
-```php
-setFallbackService(string $service): bool
-```
+### Trace context
+- forwards incoming `traceparent`
+- forwards incoming `tracestate`
+- does not invent new tracing state when none exists
 
-Sets default service used when no route matches. Requires resolver path (PHP callable or RPC).
+### Authorization
+- forwards `Authorization` unchanged
+- optional edge validation can reject invalid requests early
+- Core remains responsible for `jwt_valid` and `jwt_payload`
 
-### `listen`
+## Edge Auth Modes
 
-```php
-listen(string $host, int $port): bool
-```
-
-Starts CivetWeb listener on `host:port`.
-
-- Throws on invalid port.
-- Throws if already running.
-- Applies NTS safety fallback for thread count.
-- Initializes HTTP handling and reverse proxy behavior.
-
-### `stop`
-
-```php
-stop(): bool
-```
-
-Stops listener if running.
-
-## Route Matching Rules
-
-- Request method is matched exactly after uppercasing.
-- Exact path match has normal string equality.
-- Wildcard is supported only as trailing `*` and acts as prefix match.
-  - Example: `/api/*` matches `/api/users` and `/api/users/1`.
-- First matching route (in add order) is used.
-- If no route matches and fallback exists, fallback is used.
-- If no route and no fallback, returns `404 Not Found`.
-
-## Upstream Target Parsing
-
-Accepted forms:
-
-- `http://backend`
-- `http://backend:9001`
-- `http://backend:9001/base`
-- `https://backend`
-- `https://backend:9443/base`
-
-Defaults:
-
-- `http` -> port `80`
-- `https` -> port `443`
-- missing path -> `/`
-
-Invalid target format causes route-registration exception.
-
-## Request Handling Features
-
-### Reverse Proxy
-
-Gateway forwards:
-
-- request method
-- request URI + query string
-- most headers (hop-by-hop headers removed)
-- request body
-
-Gateway returns upstream status/headers/body back to client.
-
-### Body Size Limit
-
-`KISLAY_GATEWAY_MAX_BODY` limits request body size in bytes.
-
-- `0` means unlimited.
-- Exceeded payload returns `413 Payload Too Large`.
-
-### Optional Auth Guard
-
-Controlled by env vars:
-
+### Simple bearer token
 - `KISLAY_GATEWAY_AUTH_REQUIRED=1`
 - `KISLAY_GATEWAY_AUTH_TOKEN=<token>`
-- `KISLAY_GATEWAY_AUTH_EXCLUDE=/health,/ready,/metrics`
 
-Behavior:
+### Lightweight JWT validation
+- `KISLAY_GATEWAY_AUTH_REQUIRED=1`
+- `KISLAY_GATEWAY_JWT_SECRET=<hs256-secret>`
 
-- If required and token missing in config -> `503`.
-- Missing/invalid `Authorization: Bearer <token>` -> `401`.
-- Excluded path prefixes bypass auth.
+Validation is intentionally narrow:
+- verify token format
+- verify HS256 signature
+- verify `exp` if present
 
-### Optional Rate Limiting
+Gateway does not synthesize user or role headers from JWT claims.
 
-Controlled by:
+## Resilience
 
-- `KISLAY_GATEWAY_RATE_LIMIT_ENABLED=1`
-- `KISLAY_GATEWAY_RATE_LIMIT_REQUESTS` (default `120`)
-- `KISLAY_GATEWAY_RATE_LIMIT_WINDOW` seconds (default `60`)
+### Timeouts
+- `KISLAY_GATEWAY_READ_TIMEOUT_MS`
 
-Keyed by client IP and HTTP method. Exceeding limit returns `429`.
+### Retries
+- `KISLAY_GATEWAY_RETRY_IDEMPOTENT`
+- applies only to idempotent methods
+- applies only when the gateway fails before receiving a usable upstream response
 
-### Optional Circuit Breaker
+### Circuit breaker
+- per upstream `host:port`
+- states are effectively `closed -> open -> closed on success`
+- simple and edge-local by design
 
-Controlled by:
+## Rate limiting
 
-- `KISLAY_GATEWAY_CIRCUIT_BREAKER_ENABLED=1`
-- `KISLAY_GATEWAY_CB_FAILURE_THRESHOLD` (default `5`)
-- `KISLAY_GATEWAY_CB_OPEN_SECONDS` (default `30`)
+Current backend:
+- in-memory
 
-Per upstream host:port:
+Client identity:
+- first IP from `X-Forwarded-For`
+- otherwise `remote_addr`
 
-- repeated failures open circuit
-- open circuit returns `503 Circuit breaker open`
-- successful responses reset failure counter
+## Operational limits
 
-## Service Resolution Modes
+- On NTS builds, thread count is forced to `1`.
+- Gateway remains synchronous in its proxy path by design; Core owns the async execution engine.
 
-### PHP Resolver Callback
-
-Set using `setResolver()`.
-
-- If callback throws, returns non-string, or fails: gateway returns `502 Service resolver failed`.
-- Resolver failures are logged via PHP warnings.
-
-### RPC Resolver (Optional Build)
-
-If compiled with RPC support and callback not set:
-
-- `KISLAY_RPC_ENABLED=1`
-- `KISLAY_RPC_DISCOVERY_ENDPOINT` (default `127.0.0.1:9090`)
-- `KISLAY_RPC_TIMEOUT_MS` (default `200`)
-
-If neither callback nor RPC resolution is available, service routes return `502 Service resolver not configured`.
-
-## Thread Safety Notes
-
-### ZTS Enabled
-
-- Multi-thread worker counts are honored.
-
-### NTS (Thread Safety Disabled)
-
-- Thread count is forced to `1` with warning whenever count would be greater than `1`.
-- This allows safe operation on default Linux NTS PHP builds.
-
-## Errors and Status Codes
-
-Common responses emitted by gateway:
-
-- `401` unauthorized token issues
-- `404` no route
-- `413` payload too large
-- `429` rate limit exceeded
-- `502` upstream/service resolution failures
-- `503` auth misconfiguration or circuit open
-
-## Quick Example
+## Example
 
 ```php
 <?php
 
+$registry = new Kislay\Discovery\ServiceRegistry('http://127.0.0.1:9010');
 $gateway = new Kislay\Gateway\Gateway();
-$gateway->setThreads(4); // forced to 1 on NTS
 
-$gateway->addRoute('GET', '/public/*', 'https://httpbin.org');
-$gateway->addServiceRoute('GET', '/api/users/*', 'user-service');
-
-$gateway->setResolver(function (string $service, string $method, string $path): string {
-    if ($service === 'user-service') {
-        return 'http://127.0.0.1:9010';
+$gateway->addServiceRoute('GET', '/api/users', 'user-service');
+$gateway->setResolver(function (string $service, string $method, string $path) use ($registry): string {
+    $url = $registry->resolve($service);
+    if ($url === null) {
+        throw new RuntimeException("No healthy instance for {$service}");
     }
-    return 'http://127.0.0.1:9001';
+    return $url;
 });
 
-$gateway->setFallbackTarget('http://127.0.0.1:9000');
-$gateway->listen('0.0.0.0', 9008);
-
+$gateway->listen('0.0.0.0', 9009);
 while (true) {
     sleep(1);
 }
-```
-
-## Build and Test
-
-```bash
-phpize
-./configure --enable-kislayphp_gateway
-make
-make test
 ```
