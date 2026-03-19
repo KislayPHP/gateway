@@ -5,7 +5,7 @@ extern "C" {
 #include "php.h"
 }
 
-#define PHP_KISLAYPHP_GATEWAY_VERSION "0.0.5"
+#define PHP_KISLAYPHP_GATEWAY_VERSION "0.0.6"
 #define PHP_KISLAYPHP_GATEWAY_EXTNAME "kislayphp_gateway"
 
 extern zend_module_entry kislayphp_gateway_module_entry;

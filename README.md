@@ -9,7 +9,7 @@
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/gateway:0.0.5
+pie install kislayphp/gateway:0.0.6
 ```
 
 Add to `php.ini`:
