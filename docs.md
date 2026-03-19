@@ -92,7 +92,9 @@ Gateway does not synthesize user or role headers from JWT claims.
 
 ### Circuit breaker
 - per upstream `host:port`
-- states are effectively `closed -> open -> closed on success`
+- states are `CLOSED -> OPEN -> HALF_OPEN -> CLOSED on success`
+- one probe request is allowed after the open window expires
+- a failed probe immediately reopens the circuit
 - simple and edge-local by design
 
 ## Rate limiting

@@ -93,7 +93,7 @@ In both cases, Gateway forwards the original `Authorization` header downstream a
 Gateway keeps resilience lightweight:
 - read timeout on upstream responses
 - retry only for idempotent methods and only on pre-response upstream failures
-- simple per-upstream circuit breaker
+- simple per-upstream circuit breaker with `CLOSED / OPEN / HALF_OPEN`
 
 ## Environment Variables
 

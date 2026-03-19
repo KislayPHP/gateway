@@ -49,6 +49,7 @@ struct kislayphp_rate_limit_entry {
 struct kislayphp_circuit_state {
     zend_long failures;
     std::time_t open_until;
+    bool half_open_in_flight;
 };
 
 typedef struct _php_kislayphp_gateway_t {
@@ -675,6 +676,54 @@ static bool kislayphp_gateway_is_idempotent_method(const std::string &method) {
     return method == "GET" || method == "HEAD" || method == "OPTIONS" || method == "PUT" || method == "DELETE";
 }
 
+static bool kislayphp_gateway_circuit_allow_request(php_kislayphp_gateway_t *gateway,
+                                                    const std::string &upstream_key,
+                                                    std::time_t now,
+                                                    std::string *deny_reason = nullptr) {
+    std::lock_guard<std::mutex> guard(gateway->lock);
+    auto &state = gateway->circuit_states[upstream_key];
+    if (state.open_until > now) {
+        if (deny_reason != nullptr) {
+            *deny_reason = "Circuit breaker open";
+        }
+        return false;
+    }
+
+    if (state.open_until != 0 && state.open_until <= now) {
+        if (state.half_open_in_flight) {
+            if (deny_reason != nullptr) {
+                *deny_reason = "Circuit breaker half-open";
+            }
+            return false;
+        }
+        state.half_open_in_flight = true;
+    }
+
+    return true;
+}
+
+static void kislayphp_gateway_circuit_record_result(php_kislayphp_gateway_t *gateway,
+                                                    const std::string &upstream_key,
+                                                    std::time_t now,
+                                                    bool failed) {
+    std::lock_guard<std::mutex> guard(gateway->lock);
+    auto &state = gateway->circuit_states[upstream_key];
+    if (failed) {
+        if (state.half_open_in_flight || (state.failures + 1) >= gateway->circuit_failure_threshold) {
+            state.open_until = now + gateway->circuit_open_seconds;
+            state.failures = 0;
+            state.half_open_in_flight = false;
+            return;
+        }
+        state.failures++;
+        return;
+    }
+
+    state.failures = 0;
+    state.open_until = 0;
+    state.half_open_in_flight = false;
+}
+
 static bool kislayphp_proxy_request(struct mg_connection *conn,
                                     const struct mg_request_info *info,
                                     const kislayphp_gateway_route &route,
@@ -1047,30 +1096,16 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         if (gateway->circuit_breaker_enabled) {
             std::time_t now = std::time(nullptr);
             std::string upstream_key = resolved.host + ":" + std::to_string(resolved.port);
-            {
-                std::lock_guard<std::mutex> guard(gateway->lock);
-                auto it = gateway->circuit_states.find(upstream_key);
-                if (it != gateway->circuit_states.end() && it->second.open_until > now) {
-                    kislayphp_send_error(conn, 503, "Circuit breaker open");
-                    return 1;
-                }
+            std::string deny_reason;
+            if (!kislayphp_gateway_circuit_allow_request(gateway, upstream_key, now, &deny_reason)) {
+                kislayphp_send_error(conn, 503, deny_reason.c_str());
+                return 1;
             }
 
             int upstream_status = 0;
             bool ok_proxy = kislayphp_gateway_proxy_with_resilience(conn, info, resolved, gateway, extra_proxy_headers, &upstream_status);
             bool failed = !ok_proxy || upstream_status >= 500;
-            std::lock_guard<std::mutex> guard(gateway->lock);
-            auto &state = gateway->circuit_states[upstream_key];
-            if (failed) {
-                state.failures++;
-                if (state.failures >= gateway->circuit_failure_threshold) {
-                    state.open_until = now + gateway->circuit_open_seconds;
-                    state.failures = 0;
-                }
-            } else {
-                state.failures = 0;
-                state.open_until = 0;
-            }
+            kislayphp_gateway_circuit_record_result(gateway, upstream_key, now, failed);
             return 1;
         }
 
@@ -1085,30 +1120,16 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     if (gateway->circuit_breaker_enabled) {
         std::time_t now = std::time(nullptr);
         std::string upstream_key = match.host + ":" + std::to_string(match.port);
-        {
-            std::lock_guard<std::mutex> guard(gateway->lock);
-            auto it = gateway->circuit_states.find(upstream_key);
-            if (it != gateway->circuit_states.end() && it->second.open_until > now) {
-                kislayphp_send_error(conn, 503, "Circuit breaker open");
-                return 1;
-            }
+        std::string deny_reason;
+        if (!kislayphp_gateway_circuit_allow_request(gateway, upstream_key, now, &deny_reason)) {
+            kislayphp_send_error(conn, 503, deny_reason.c_str());
+            return 1;
         }
 
         int upstream_status = 0;
         bool ok_proxy = kislayphp_gateway_proxy_with_resilience(conn, info, match, gateway, extra_proxy_headers, &upstream_status);
         bool failed = !ok_proxy || upstream_status >= 500;
-        std::lock_guard<std::mutex> guard(gateway->lock);
-        auto &state = gateway->circuit_states[upstream_key];
-        if (failed) {
-            state.failures++;
-            if (state.failures >= gateway->circuit_failure_threshold) {
-                state.open_until = now + gateway->circuit_open_seconds;
-                state.failures = 0;
-            }
-        } else {
-            state.failures = 0;
-            state.open_until = 0;
-        }
+        kislayphp_gateway_circuit_record_result(gateway, upstream_key, now, failed);
         return 1;
     }
 
