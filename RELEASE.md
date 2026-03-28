@@ -32,4 +32,7 @@ make test
 - Confirm `README.md`, `composer.json`, and `package.xml` are up to date.
 - Confirm `package.xml` release and API versions are set correctly.
 - Confirm docs reflect current namespace (`Kislay\\...`) and legacy alias compatibility (`KislayPHP\\...`).
+- Confirm ZTS behavior is documented honestly:
+  - direct routes may use worker threads
+  - PHP resolvers are rejected on ZTS builds
 - Tag release and push tag to origin.

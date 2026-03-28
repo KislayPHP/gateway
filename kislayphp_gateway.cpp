@@ -52,6 +52,39 @@ struct kislayphp_circuit_state {
     bool half_open_in_flight;
 };
 
+struct kislayphp_upstream_pool {
+    std::unordered_map<std::string, struct mg_connection *> idle;
+
+    ~kislayphp_upstream_pool() {
+        for (auto &entry : idle) {
+            if (entry.second != nullptr) {
+                mg_close_connection(entry.second);
+            }
+        }
+    }
+
+    struct mg_connection *take(const std::string &key) {
+        auto it = idle.find(key);
+        if (it == idle.end()) {
+            return nullptr;
+        }
+        struct mg_connection *conn = it->second;
+        idle.erase(it);
+        return conn;
+    }
+
+    void put(const std::string &key, struct mg_connection *conn) {
+        if (conn == nullptr) {
+            return;
+        }
+        auto it = idle.find(key);
+        if (it != idle.end() && it->second != nullptr) {
+            mg_close_connection(it->second);
+        }
+        idle[key] = conn;
+    }
+};
+
 typedef struct _php_kislayphp_gateway_t {
     std::vector<kislayphp_gateway_route> routes;
     kislayphp_gateway_route fallback_route;
@@ -82,6 +115,13 @@ typedef struct _php_kislayphp_gateway_t {
 } php_kislayphp_gateway_t;
 
 static zend_object_handlers kislayphp_gateway_handlers;
+
+static kislayphp_upstream_pool &kislayphp_gateway_upstream_pool() {
+    static thread_local kislayphp_upstream_pool pool;
+    return pool;
+}
+
+static std::string kislayphp_client_identifier(const struct mg_request_info *info);
 
 static zend_long kislayphp_env_long(const char *name, zend_long fallback) {
     const char *value = std::getenv(name);
@@ -276,6 +316,109 @@ static const char *kislayphp_get_header(const struct mg_request_info *info, cons
         }
     }
     return nullptr;
+}
+
+static bool kislayphp_header_has_token(const char *value, const char *token) {
+    if (value == nullptr || token == nullptr) {
+        return false;
+    }
+
+    std::string haystack(value);
+    std::string needle(token);
+    std::transform(haystack.begin(), haystack.end(), haystack.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    std::transform(needle.begin(), needle.end(), needle.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    size_t start = 0;
+    while (start <= haystack.size()) {
+        size_t comma = haystack.find(',', start);
+        std::string chunk = comma == std::string::npos
+            ? haystack.substr(start)
+            : haystack.substr(start, comma - start);
+        chunk = kislayphp_trim(chunk);
+        if (chunk == needle) {
+            return true;
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
+static bool kislayphp_response_header_has_token(const struct mg_response_info *resp_info,
+                                                const char *name,
+                                                const char *token) {
+    if (resp_info == nullptr) {
+        return false;
+    }
+    for (int i = 0; i < resp_info->num_headers; ++i) {
+        const char *hname = resp_info->http_headers[i].name;
+        const char *hvalue = resp_info->http_headers[i].value;
+        if (hname == nullptr || hvalue == nullptr) {
+            continue;
+        }
+        if (::strcasecmp(hname, name) == 0) {
+            return kislayphp_header_has_token(hvalue, token);
+        }
+    }
+    return false;
+}
+
+static std::string kislayphp_request_forwarded_for(const struct mg_request_info *info) {
+    std::string client = kislayphp_client_identifier(info);
+    const char *existing = kislayphp_get_header(info, "X-Forwarded-For");
+    if (existing == nullptr || *existing == '\0') {
+        return client;
+    }
+    std::string combined(existing);
+    if (!combined.empty()) {
+        combined.append(", ");
+    }
+    combined.append(client);
+    return combined;
+}
+
+static std::string kislayphp_request_forwarded_proto(const struct mg_request_info *info) {
+    const char *existing = kislayphp_get_header(info, "X-Forwarded-Proto");
+    if (existing != nullptr && *existing != '\0') {
+        return std::string(existing);
+    }
+    return (info != nullptr && info->is_ssl) ? "https" : "http";
+}
+
+static std::string kislayphp_request_forwarded_host(const struct mg_request_info *info) {
+    const char *existing = kislayphp_get_header(info, "X-Forwarded-Host");
+    if (existing != nullptr && *existing != '\0') {
+        return std::string(existing);
+    }
+    const char *host = kislayphp_get_header(info, "Host");
+    if (host != nullptr && *host != '\0') {
+        return std::string(host);
+    }
+    return "unknown";
+}
+
+static std::string kislayphp_upstream_key(const kislayphp_gateway_route &route) {
+    return std::string(route.use_tls ? "https://" : "http://")
+        + route.host + ":" + std::to_string(route.port);
+}
+
+static bool kislayphp_can_reuse_upstream_response(const struct mg_response_info *resp_info) {
+    if (resp_info == nullptr) {
+        return false;
+    }
+    if (kislayphp_response_header_has_token(resp_info, "Connection", "close")) {
+        return false;
+    }
+    if (resp_info->content_length >= 0) {
+        return true;
+    }
+    return kislayphp_response_header_has_token(resp_info, "Transfer-Encoding", "chunked");
 }
 
 static bool kislayphp_has_prefix(const std::string &value, const std::string &prefix) {
@@ -744,23 +887,6 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         }
         return false;
     }
-    char error_buf[256] = {0};
-    struct mg_connection *target = mg_connect_client(route.host.c_str(), route.port, route.use_tls ? 1 : 0, error_buf, sizeof(error_buf));
-    if (target == nullptr) {
-        php_error_docref(nullptr, E_WARNING, "Upstream connect failed for %s://%s:%d (%s)",
-                         route.use_tls ? "https" : "http",
-                         route.host.c_str(),
-                         route.port,
-                         error_buf[0] != '\0' ? error_buf : "unknown error");
-        if (write_error_response) {
-            kislayphp_send_error(conn, 502, "Upstream connect failed");
-        }
-        if (status_code_out != nullptr) {
-            *status_code_out = 502;
-        }
-        return false;
-    }
-
     std::string path = info->local_uri ? info->local_uri : (info->request_uri ? info->request_uri : "/");
     std::string target_path = kislayphp_join_paths(route.base_path, path);
     if (info->query_string && *info->query_string) {
@@ -769,120 +895,230 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
 
     std::string method = info->request_method ? info->request_method : "GET";
-    mg_printf(target, "%s %s HTTP/1.1\r\n", method.c_str(), target_path.c_str());
-    mg_printf(target, "Host: %s:%d\r\n", route.host.c_str(), route.port);
-    mg_printf(target, "Connection: close\r\n");
+    std::string forwarded_for = kislayphp_request_forwarded_for(info);
+    std::string forwarded_proto = kislayphp_request_forwarded_proto(info);
+    std::string forwarded_host = kislayphp_request_forwarded_host(info);
+    std::string upstream_key = kislayphp_upstream_key(route);
 
-    // X-Forwarded Headers
-    mg_printf(target, "X-Forwarded-For: %s\r\n", kislayphp_client_identifier(info).c_str());
-    mg_printf(target, "X-Forwarded-Proto: %s\r\n", route.use_tls ? "https" : "http");
-    mg_printf(target, "X-Forwarded-Host: %s\r\n", info->http_headers[0].value ? info->http_headers[0].value : "unknown");
+    auto &pool = kislayphp_gateway_upstream_pool();
 
-    // Inject extra headers (e.g. X-Authenticated-User, X-Auth-Roles from JWT)
-    for (const auto &h : extra_headers) {
-        mg_printf(target, "%s: %s\r\n", h.first.c_str(), h.second.c_str());
-    }
-
-    bool has_content_length = false;
-    for (int i = 0; i < info->num_headers; ++i) {
-        const char *name = info->http_headers[i].name;
-        const char *value = info->http_headers[i].value;
-        if (name == nullptr || value == nullptr) {
-            continue;
+    for (int connect_attempt = 0; connect_attempt < 2; ++connect_attempt) {
+        char error_buf[256] = {0};
+        struct mg_connection *target = pool.take(upstream_key);
+        bool from_pool = target != nullptr;
+        bool pooled_retry_allowed = from_pool && kislayphp_gateway_is_idempotent_method(method);
+        if (target == nullptr) {
+            target = mg_connect_client(route.host.c_str(), route.port, route.use_tls ? 1 : 0, error_buf, sizeof(error_buf));
         }
-        if (::strcasecmp(name, "Host") == 0 || 
-            ::strcasecmp(name, "X-Forwarded-For") == 0 ||
-            ::strcasecmp(name, "X-Forwarded-Proto") == 0 ||
-            ::strcasecmp(name, "X-Forwarded-Host") == 0 ||
-            kislayphp_is_hop_header(name)) {
-            continue;
+        if (target == nullptr) {
+            php_error_docref(nullptr, E_WARNING, "Upstream connect failed for %s://%s:%d (%s)",
+                             route.use_tls ? "https" : "http",
+                             route.host.c_str(),
+                             route.port,
+                             error_buf[0] != '\0' ? error_buf : "unknown error");
+            if (write_error_response) {
+                kislayphp_send_error(conn, 502, "Upstream connect failed");
+            }
+            if (status_code_out != nullptr) {
+                *status_code_out = 502;
+            }
+            return false;
         }
-        if (::strcasecmp(name, "Content-Length") == 0) {
-            has_content_length = true;
+
+        if (mg_printf(target, "%s %s HTTP/1.1\r\n", method.c_str(), target_path.c_str()) <= 0 ||
+            mg_printf(target, "Host: %s:%d\r\n", route.host.c_str(), route.port) <= 0 ||
+            mg_printf(target, "Connection: keep-alive\r\n") <= 0 ||
+            mg_printf(target, "X-Forwarded-For: %s\r\n", forwarded_for.c_str()) <= 0 ||
+            mg_printf(target, "X-Forwarded-Proto: %s\r\n", forwarded_proto.c_str()) <= 0 ||
+            mg_printf(target, "X-Forwarded-Host: %s\r\n", forwarded_host.c_str()) <= 0) {
+            mg_close_connection(target);
+            if (pooled_retry_allowed) {
+                continue;
+            }
+            if (write_error_response) {
+                kislayphp_send_error(conn, 502, "Upstream request write failed");
+            }
+            if (status_code_out != nullptr) {
+                *status_code_out = 502;
+            }
+            return false;
         }
-        mg_printf(target, "%s: %s\r\n", name, value);
-    }
 
-    if (!has_content_length && info->content_length >= 0) {
-        mg_printf(target, "Content-Length: %lld\r\n", static_cast<long long>(info->content_length));
-    }
-    mg_printf(target, "\r\n");
-
-    // Chunked Body Proxying (Streaming)
-    if (info->content_length > 0) {
-        char buffer[8192];
-        long long remaining = info->content_length;
-        while (remaining > 0) {
-            int to_read = remaining > (long long)sizeof(buffer) ? (int)sizeof(buffer) : (int)remaining;
-            int read_now = mg_read(conn, buffer, to_read);
-            if (read_now <= 0) break;
-            mg_write(target, buffer, (size_t)read_now);
-            remaining -= read_now;
+        for (const auto &h : extra_headers) {
+            if (mg_printf(target, "%s: %s\r\n", h.first.c_str(), h.second.c_str()) <= 0) {
+                mg_close_connection(target);
+                if (pooled_retry_allowed) {
+                    continue;
+                }
+                if (write_error_response) {
+                    kislayphp_send_error(conn, 502, "Upstream request write failed");
+                }
+                if (status_code_out != nullptr) {
+                    *status_code_out = 502;
+                }
+                return false;
+            }
         }
-    }
 
-    int response_timeout = static_cast<int>(read_timeout_ms > 0 ? read_timeout_ms : 10000);
-    if (mg_get_response(target, error_buf, sizeof(error_buf), response_timeout) < 0) {
-        mg_close_connection(target);
-        if (write_error_response) {
-            kislayphp_send_error(conn, 502, "Upstream response failed");
-        }
-        if (status_code_out != nullptr) {
-            *status_code_out = 502;
-        }
-        return false;
-    }
-
-    const struct mg_response_info *resp_info = mg_get_response_info(target);
-    int status_code = resp_info ? resp_info->status_code : 502;
-    if (status_code_out != nullptr) {
-        *status_code_out = status_code;
-    }
-    const char *status_text = (resp_info && resp_info->status_text) ? resp_info->status_text : "Bad Gateway";
-    mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
-
-    bool resp_has_length = false;
-    bool resp_has_request_id = false;
-    if (resp_info) {
-        for (int i = 0; i < resp_info->num_headers; ++i) {
-            const char *name = resp_info->http_headers[i].name;
-            const char *value = resp_info->http_headers[i].value;
+        bool has_content_length = false;
+        bool request_write_failed = false;
+        for (int i = 0; i < info->num_headers; ++i) {
+            const char *name = info->http_headers[i].name;
+            const char *value = info->http_headers[i].value;
             if (name == nullptr || value == nullptr) {
                 continue;
             }
-            if (kislayphp_is_hop_header(name)) {
+            if (::strcasecmp(name, "Host") == 0 ||
+                ::strcasecmp(name, "X-Forwarded-For") == 0 ||
+                ::strcasecmp(name, "X-Forwarded-Proto") == 0 ||
+                ::strcasecmp(name, "X-Forwarded-Host") == 0 ||
+                kislayphp_is_hop_header(name)) {
                 continue;
             }
             if (::strcasecmp(name, "Content-Length") == 0) {
-                resp_has_length = true;
+                has_content_length = true;
             }
-            if (::strcasecmp(name, "X-Request-ID") == 0) {
-                resp_has_request_id = true;
-            }
-            mg_printf(conn, "%s: %s\r\n", name, value);
-        }
-        if (!resp_has_length && resp_info->content_length >= 0) {
-            mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
-        }
-    }
-    if (!resp_has_request_id) {
-        for (const auto &header : extra_headers) {
-            if (::strcasecmp(header.first.c_str(), "X-Request-ID") == 0) {
-                mg_printf(conn, "X-Request-ID: %s\r\n", header.second.c_str());
+            if (mg_printf(target, "%s: %s\r\n", name, value) <= 0) {
+                request_write_failed = true;
                 break;
             }
         }
-    }
-    mg_printf(conn, "Connection: close\r\n\r\n");
 
-    char buffer[8192];
-    int read_len = 0;
-    while ((read_len = mg_read(target, buffer, sizeof(buffer))) > 0) {
-        mg_write(conn, buffer, static_cast<size_t>(read_len));
+        if (!request_write_failed && !has_content_length && info->content_length >= 0) {
+            if (mg_printf(target, "Content-Length: %lld\r\n", static_cast<long long>(info->content_length)) <= 0) {
+                request_write_failed = true;
+            }
+        }
+        if (!request_write_failed && mg_printf(target, "\r\n") <= 0) {
+            request_write_failed = true;
+        }
+        if (request_write_failed) {
+            mg_close_connection(target);
+            if (pooled_retry_allowed) {
+                continue;
+            }
+            if (write_error_response) {
+                kislayphp_send_error(conn, 502, "Upstream request write failed");
+            }
+            if (status_code_out != nullptr) {
+                *status_code_out = 502;
+            }
+            return false;
+        }
+
+        if (info->content_length > 0) {
+            char buffer[8192];
+            long long remaining = info->content_length;
+            while (remaining > 0) {
+                int to_read = remaining > static_cast<long long>(sizeof(buffer))
+                    ? static_cast<int>(sizeof(buffer))
+                    : static_cast<int>(remaining);
+                int read_now = mg_read(conn, buffer, to_read);
+                if (read_now <= 0 || mg_write(target, buffer, static_cast<size_t>(read_now)) != read_now) {
+                    request_write_failed = true;
+                    break;
+                }
+                remaining -= read_now;
+            }
+        }
+
+        if (request_write_failed) {
+            mg_close_connection(target);
+            if (pooled_retry_allowed) {
+                continue;
+            }
+            if (write_error_response) {
+                kislayphp_send_error(conn, 502, "Upstream request body failed");
+            }
+            if (status_code_out != nullptr) {
+                *status_code_out = 502;
+            }
+            return false;
+        }
+
+        int response_timeout = static_cast<int>(read_timeout_ms > 0 ? read_timeout_ms : 10000);
+        if (mg_get_response(target, error_buf, sizeof(error_buf), response_timeout) < 0) {
+            mg_close_connection(target);
+            if (pooled_retry_allowed) {
+                continue;
+            }
+            if (write_error_response) {
+                kislayphp_send_error(conn, 502, "Upstream response failed");
+            }
+            if (status_code_out != nullptr) {
+                *status_code_out = 502;
+            }
+            return false;
+        }
+
+        const struct mg_response_info *resp_info = mg_get_response_info(target);
+        int status_code = resp_info ? resp_info->status_code : 502;
+        if (status_code_out != nullptr) {
+            *status_code_out = status_code;
+        }
+        const char *status_text = (resp_info && resp_info->status_text) ? resp_info->status_text : "Bad Gateway";
+        mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
+
+        bool resp_has_length = false;
+        bool resp_has_request_id = false;
+        if (resp_info) {
+            for (int i = 0; i < resp_info->num_headers; ++i) {
+                const char *name = resp_info->http_headers[i].name;
+                const char *value = resp_info->http_headers[i].value;
+                if (name == nullptr || value == nullptr) {
+                    continue;
+                }
+                if (kislayphp_is_hop_header(name)) {
+                    continue;
+                }
+                if (::strcasecmp(name, "Content-Length") == 0) {
+                    resp_has_length = true;
+                }
+                if (::strcasecmp(name, "X-Request-ID") == 0) {
+                    resp_has_request_id = true;
+                }
+                mg_printf(conn, "%s: %s\r\n", name, value);
+            }
+            if (!resp_has_length && resp_info->content_length >= 0) {
+                mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
+            }
+        }
+        if (!resp_has_request_id) {
+            for (const auto &header : extra_headers) {
+                if (::strcasecmp(header.first.c_str(), "X-Request-ID") == 0) {
+                    mg_printf(conn, "X-Request-ID: %s\r\n", header.second.c_str());
+                    break;
+                }
+            }
+        }
+        mg_printf(conn, "Connection: close\r\n\r\n");
+
+        char buffer[8192];
+        int read_len = 0;
+        while ((read_len = mg_read(target, buffer, sizeof(buffer))) > 0) {
+            mg_write(conn, buffer, static_cast<size_t>(read_len));
+        }
+
+        if (read_len < 0) {
+            mg_close_connection(target);
+            return false;
+        }
+
+        if (kislayphp_can_reuse_upstream_response(resp_info)) {
+            pool.put(upstream_key, target);
+        } else {
+            mg_close_connection(target);
+        }
+        return true;
     }
 
-    mg_close_connection(target);
-    return true;
+    if (write_error_response) {
+        kislayphp_send_error(conn, 502, "Upstream response failed");
+    }
+    if (status_code_out != nullptr) {
+        *status_code_out = 502;
+    }
+    return false;
 }
 
 static bool kislayphp_gateway_proxy_with_resilience(struct mg_connection *conn,
@@ -1326,6 +1562,17 @@ PHP_METHOD(KislayPHPGateway, listen) {
     }
     kislayphp_disable_stack_guard_for_nts("Kislay\\Gateway\\Gateway::listen");
     obj->thread_count = kislayphp_sanitize_thread_count(obj->thread_count, "Kislay\\Gateway\\Gateway::listen");
+#if defined(ZTS)
+    {
+        std::lock_guard<std::mutex> guard(obj->lock);
+        if (obj->has_resolver) {
+            zend_throw_exception(zend_ce_exception,
+                                 "PHP resolvers are not supported on ZTS builds; use RPC discovery or direct targets",
+                                 0);
+            RETURN_FALSE;
+        }
+    }
+#endif
 
     std::string listen_addr = std::string(host, host_len) + ":" + std::to_string(port);
     std::vector<const char *> options;
