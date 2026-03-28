@@ -9,7 +9,7 @@
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/gateway:0.0.6
+pie install kislayphp/gateway:0.0.7
 ```
 
 Add to `php.ini`:
@@ -46,23 +46,16 @@ while (true) {
 ```php
 <?php
 
-$registry = new Kislay\Discovery\ServiceRegistry('http://127.0.0.1:9010');
-$gateway  = new Kislay\Gateway\Gateway();
-
+$gateway = new Kislay\Gateway\Gateway();
 $gateway->addServiceRoute('GET', '/api/users', 'user-service');
-$gateway->setResolver(function (string $service, string $method, string $path) use ($registry): string {
-    $url = $registry->resolve($service);
-    if ($url === null) {
-        throw new RuntimeException("No healthy instance for {$service}");
-    }
-    return $url;
-});
-
 $gateway->listen('0.0.0.0', 9009);
+
 while (true) {
     sleep(1);
 }
 ```
+
+When `KISLAYPHP_RPC_ENABLED=1` is configured, service routes resolve through Discovery RPC without a PHP callback.
 
 ## Runtime Behavior
 
@@ -79,6 +72,7 @@ Gateway forwards:
 - `tracestate`
 
 Gateway generates `X-Request-ID` only when the incoming request does not provide one.
+Gateway preserves upstream `X-Forwarded-For` chains, forwards the incoming host, and derives `X-Forwarded-Proto` from the actual client-facing scheme.
 
 ### Auth alignment
 
@@ -94,6 +88,7 @@ Gateway keeps resilience lightweight:
 - read timeout on upstream responses
 - retry only for idempotent methods and only on pre-response upstream failures
 - simple per-upstream circuit breaker with `CLOSED / OPEN / HALF_OPEN`
+- thread-local upstream connection reuse for direct routes
 
 ## Environment Variables
 
@@ -118,6 +113,7 @@ Gateway keeps resilience lightweight:
 
 - `listen()` starts the server and returns; keep the process alive explicitly.
 - Retry is intentionally narrow. Gateway is not a replacement for Core's async execution layer.
+- On ZTS builds, PHP resolvers are rejected at `listen()` time. Use Discovery RPC or direct targets there.
 - Rate limiting currently uses in-memory storage.
 
 ## License

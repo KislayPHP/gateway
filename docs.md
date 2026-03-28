@@ -38,6 +38,8 @@ Resolver signature:
 function (string $service, string $method, string $path): string
 ```
 
+This is supported on NTS builds only. ZTS builds reject PHP resolvers at `listen()` time because request threads do not execute userland resolvers safely.
+
 ### `listen(string $host, int $port): bool`
 Starts the gateway listener and returns after startup.
 
@@ -57,6 +59,11 @@ Gateway preserves the Core contract.
 - forwards incoming `traceparent`
 - forwards incoming `tracestate`
 - does not invent new tracing state when none exists
+
+### Forwarded headers
+- appends the current client IP to `X-Forwarded-For`
+- preserves incoming `X-Forwarded-Host` or falls back to `Host`
+- preserves incoming `X-Forwarded-Proto` or derives it from the client-facing TLS state
 
 ### Authorization
 - forwards `Authorization` unchanged
@@ -109,25 +116,18 @@ Client identity:
 ## Operational limits
 
 - On NTS builds, thread count is forced to `1`.
+- On ZTS builds, direct target routes can use request threads, but PHP resolvers are rejected.
 - Gateway remains synchronous in its proxy path by design; Core owns the async execution engine.
+- Direct upstream targets reuse thread-local upstream connections when the upstream response is safely framed.
 
 ## Example
 
 ```php
 <?php
 
-$registry = new Kislay\Discovery\ServiceRegistry('http://127.0.0.1:9010');
 $gateway = new Kislay\Gateway\Gateway();
 
 $gateway->addServiceRoute('GET', '/api/users', 'user-service');
-$gateway->setResolver(function (string $service, string $method, string $path) use ($registry): string {
-    $url = $registry->resolve($service);
-    if ($url === null) {
-        throw new RuntimeException("No healthy instance for {$service}");
-    }
-    return $url;
-});
-
 $gateway->listen('0.0.0.0', 9009);
 while (true) {
     sleep(1);
