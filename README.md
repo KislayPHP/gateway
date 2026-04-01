@@ -9,7 +9,7 @@
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/gateway:0.0.8
+pie install kislayphp/gateway:0.0.9
 ```
 
 Add to `php.ini`:
@@ -48,6 +48,10 @@ while (true) {
 
 $gateway = new Kislay\Gateway\Gateway();
 $gateway->addServiceRoute('GET', '/api/users', 'user-service');
+$gateway->registerService('user-service', [
+    'http://127.0.0.1:9001',
+    'http://127.0.0.1:9002',
+]);
 $gateway->listen('0.0.0.0', 9009);
 
 while (true) {
@@ -55,7 +59,13 @@ while (true) {
 }
 ```
 
-When `KISLAYPHP_RPC_ENABLED=1` is configured, service routes resolve through Discovery RPC without a PHP callback.
+Service route resolution order is:
+
+1. native C++ service registry via `registerService()`
+2. PHP `setResolver()` callback if configured
+3. Discovery RPC when `KISLAYPHP_RPC_ENABLED=1`
+
+For production, prefer `registerService()` so request threads stay on the native path.
 
 ## Runtime Behavior
 
@@ -113,6 +123,7 @@ Gateway keeps resilience lightweight:
 
 - `listen()` starts the server and returns; keep the process alive explicitly.
 - Retry is intentionally narrow. Gateway is not a replacement for Core's async execution layer.
+- `registerService()` is the recommended production service discovery path. It publishes a native registry snapshot and avoids PHP callbacks on the request path.
 - On ZTS builds, PHP resolvers are rejected at `listen()` time. Use Discovery RPC or direct targets there.
 - Rate limiting currently uses in-memory storage.
 

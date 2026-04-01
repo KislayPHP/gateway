@@ -35,4 +35,5 @@ make test
 - Confirm ZTS behavior is documented honestly:
   - direct routes may use worker threads
   - PHP resolvers are rejected on ZTS builds
+- Confirm service-route docs prefer `registerService()` for the native production path and describe `setResolver()` as compatibility fallback.
 - Tag release and push tag to origin.

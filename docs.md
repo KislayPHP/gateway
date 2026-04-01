@@ -31,6 +31,18 @@ Direct upstream route.
 ### `addServiceRoute(string $method, string $path, string $service): bool`
 Logical service route resolved at request time.
 
+### `registerService(string $service, array $targets): bool`
+Registers a native C++ service target list for production service routing.
+
+Example:
+
+```php
+$gateway->registerService('user-service', [
+    'http://127.0.0.1:9001',
+    'http://127.0.0.1:9002',
+]);
+```
+
 ### `setResolver(callable $resolver): bool`
 Resolver signature:
 
@@ -39,6 +51,14 @@ function (string $service, string $method, string $path): string
 ```
 
 This is supported on NTS builds only. ZTS builds reject PHP resolvers at `listen()` time because request threads do not execute userland resolvers safely.
+
+Resolution order for service routes is:
+
+1. native service registry via `registerService()`
+2. PHP resolver via `setResolver()`
+3. Discovery RPC when enabled
+
+For production, prefer `registerService()` because it keeps service routing off the Zend callback path.
 
 ### `listen(string $host, int $port): bool`
 Starts the gateway listener and returns after startup.
@@ -128,6 +148,10 @@ Client identity:
 $gateway = new Kislay\Gateway\Gateway();
 
 $gateway->addServiceRoute('GET', '/api/users', 'user-service');
+$gateway->registerService('user-service', [
+    'http://127.0.0.1:9001',
+    'http://127.0.0.1:9002',
+]);
 $gateway->listen('0.0.0.0', 9009);
 while (true) {
     sleep(1);
