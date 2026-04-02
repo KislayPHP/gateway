@@ -263,6 +263,10 @@ static bool is_hop_header(const char *buffer, const HeaderRef &header) {
 static void queue_error_response(Connection *conn, int status, const char *message, bool close_after) {
     conn->client_buffer.clear();
     conn->safe_upstream_keep_alive = false;
+    conn->splice_enabled = false;
+    conn->splice_eof = false;
+    conn->remaining_bytes = 0;
+    conn->pipe_buffered_bytes = 0;
     conn->passthrough_response_headers = false;
     conn->response_header_bytes = 0;
     conn->response_header_forwarded = 0;
@@ -436,6 +440,7 @@ static bool refresh_upstream_interest(WorkerRuntime *rt, Connection *conn);
 static bool finish_response(WorkerRuntime *rt, Connection *conn);
 static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn);
 static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn);
+static bool handle_splice_response_body(WorkerRuntime *rt, Connection *conn);
 static bool handle_client_write(WorkerRuntime *rt, Connection *conn);
 
 static uint32_t connection_index(WorkerRuntime *rt, Connection *conn) {
@@ -480,6 +485,11 @@ static uint32_t desired_client_events(const Connection *conn) {
                 events |= EPOLLOUT;
             }
             break;
+        case ConnState::SpliceResponseBody:
+            if (conn->pipe_buffered_bytes > 0) {
+                events |= EPOLLOUT;
+            }
+            break;
         default:
             break;
     }
@@ -495,6 +505,11 @@ static uint32_t desired_upstream_events(const Connection *conn) {
             break;
         case ConnState::ReadUpstream:
             if (conn->upstream_buffer.writable() > 0) {
+                events |= EPOLLIN;
+            }
+            break;
+        case ConnState::SpliceResponseBody:
+            if (conn->remaining_bytes > 0 && conn->pipe_buffered_bytes == 0) {
                 events |= EPOLLIN;
             }
             break;
@@ -530,6 +545,13 @@ static void epoll_del(int epoll_fd, int fd) {
 }
 
 static void release_connection(WorkerRuntime *rt, Connection *conn) {
+    if (conn->pipefd[0] >= 0) {
+        close_fd(conn->pipefd[0]);
+    }
+    if (conn->pipefd[1] >= 0) {
+        close_fd(conn->pipefd[1]);
+    }
+    conn->pipe_initialized = false;
     if (conn->client_fd >= 0) {
         epoll_del(rt->epoll_fd, conn->client_fd);
         close_fd(conn->client_fd);
@@ -966,6 +988,33 @@ static bool build_client_response_header(Connection *conn) {
     return true;
 }
 
+static bool ensure_splice_pipe(Connection *conn) {
+    if (conn->pipe_initialized && conn->pipefd[0] >= 0 && conn->pipefd[1] >= 0) {
+        return true;
+    }
+    int pipefd[2];
+#ifdef O_CLOEXEC
+    if (pipe2(pipefd, O_NONBLOCK | O_CLOEXEC) != 0) {
+        return false;
+    }
+#else
+    if (pipe(pipefd) != 0) {
+        return false;
+    }
+    if (fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL, 0) | O_NONBLOCK) != 0 ||
+        fcntl(pipefd[1], F_SETFL, fcntl(pipefd[1], F_GETFL, 0) | O_NONBLOCK) != 0) {
+        close_fd(pipefd[0]);
+        close_fd(pipefd[1]);
+        return false;
+    }
+#endif
+    conn->pipefd[0] = pipefd[0];
+    conn->pipefd[1] = pipefd[1];
+    conn->pipe_initialized = true;
+    conn->pipe_buffered_bytes = 0;
+    return true;
+}
+
 static bool can_passthrough_response_headers(const Connection *conn) {
     if (!conn->client_keep_alive || conn->pipelined_bytes) {
         return false;
@@ -981,6 +1030,23 @@ static bool can_passthrough_response_headers(const Connection *conn) {
         return false;
     }
     if (!conn->response.has_content_length && !conn->response.no_body) {
+        return false;
+    }
+    return true;
+}
+
+static bool can_splice_response_body(const Connection *conn) {
+    if (conn->response.version_len != 8) {
+        return false;
+    }
+    const char *response_buffer = conn->upstream_buffer.data();
+    if (std::memcmp(response_buffer + conn->response.version_off, "HTTP/1.1", 8) != 0) {
+        return false;
+    }
+    if (!conn->response.has_content_length || conn->response.no_body) {
+        return false;
+    }
+    if (conn->response.chunked || conn->response.close_delimited) {
         return false;
     }
     return true;
@@ -1021,6 +1087,10 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
             !conn->response.chunked &&
             !conn->response.close_delimited;
         conn->close_after_response = !conn->safe_client_keep_alive;
+        conn->splice_enabled = can_splice_response_body(conn);
+        conn->remaining_bytes = conn->response_body_expected;
+        conn->splice_eof = false;
+        conn->pipe_buffered_bytes = 0;
         conn->passthrough_response_headers = can_passthrough_response_headers(conn);
         conn->response_header_bytes = conn->response.headers_end;
         conn->response_header_forwarded = 0;
@@ -1068,6 +1138,82 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
     return true;
 }
 
+static bool handle_splice_response_body(WorkerRuntime *rt, Connection *conn) {
+    if (!conn->splice_enabled) {
+        conn->state = ConnState::ReadUpstream;
+        if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
+            return false;
+        }
+        return handle_upstream_read(rt, conn);
+    }
+    if (!ensure_splice_pipe(conn)) {
+        conn->splice_enabled = false;
+        conn->state = ConnState::ReadUpstream;
+        if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
+            return false;
+        }
+        return handle_upstream_read(rt, conn);
+    }
+
+    static const std::size_t kSpliceChunk = 64 * 1024;
+
+    for (;;) {
+        if (conn->pipe_buffered_bytes > 0) {
+            const ssize_t moved = splice(conn->pipefd[0], nullptr, conn->client_fd, nullptr,
+                                         conn->pipe_buffered_bytes, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            if (moved > 0) {
+                conn->pipe_buffered_bytes -= static_cast<uint32_t>(moved);
+                conn->response_body_forwarded += static_cast<uint64_t>(moved);
+                if (conn->remaining_bytes >= static_cast<uint64_t>(moved)) {
+                    conn->remaining_bytes -= static_cast<uint64_t>(moved);
+                } else {
+                    conn->remaining_bytes = 0;
+                }
+                if (conn->remaining_bytes == 0 && conn->pipe_buffered_bytes == 0) {
+                    return finish_response(rt, conn);
+                }
+                continue;
+            }
+            if (moved < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            }
+            return false;
+        }
+
+        if (conn->remaining_bytes == 0) {
+            return finish_response(rt, conn);
+        }
+
+        const std::size_t want =
+            static_cast<std::size_t>(std::min<uint64_t>(conn->remaining_bytes, static_cast<uint64_t>(kSpliceChunk)));
+        const ssize_t moved_in = splice(conn->upstream_fd, nullptr, conn->pipefd[1], nullptr, want,
+                                        SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (moved_in > 0) {
+            conn->pipe_buffered_bytes += static_cast<uint32_t>(moved_in);
+            continue;
+        }
+        if (moved_in == 0) {
+            conn->splice_eof = true;
+            return false;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            break;
+        }
+        if ((errno == EINVAL || errno == ENOSYS) && conn->pipe_buffered_bytes == 0) {
+            conn->splice_enabled = false;
+            conn->state = ConnState::ReadUpstream;
+            if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
+                return false;
+            }
+            return handle_upstream_read(rt, conn);
+        }
+        return false;
+    }
+
+    conn->state = ConnState::SpliceResponseBody;
+    return refresh_client_interest(rt, conn) && refresh_upstream_interest(rt, conn);
+}
+
 static bool finish_response(WorkerRuntime *rt, Connection *conn) {
     recycle_upstream_side(rt, conn);
     if (conn->safe_client_keep_alive) {
@@ -1098,6 +1244,9 @@ static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
             upstream_forwarded -= header_sent;
         }
         conn->response_body_forwarded += static_cast<uint64_t>(upstream_forwarded);
+        if (conn->splice_enabled && conn->response_body_expected >= conn->response_body_forwarded) {
+            conn->remaining_bytes = conn->response_body_expected - conn->response_body_forwarded;
+        }
     }
 
     if (conn->response_parsed && conn->response.no_body && conn->client_buffer.empty() && conn->upstream_buffer.empty()) {
@@ -1112,13 +1261,18 @@ static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
     }
 
     if (conn->client_buffer.empty() && conn->upstream_buffer.empty() && conn->response_parsed) {
-        conn->state = ConnState::ReadUpstream;
+        conn->state = (conn->splice_enabled && conn->remaining_bytes > 0)
+                          ? ConnState::SpliceResponseBody
+                          : ConnState::ReadUpstream;
     }
     if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
         return false;
     }
     if (conn->state == ConnState::ReadUpstream) {
         return handle_upstream_read(rt, conn);
+    }
+    if (conn->state == ConnState::SpliceResponseBody) {
+        return handle_splice_response_body(rt, conn);
     }
     return true;
 }
@@ -1255,7 +1409,9 @@ static void worker_loop(EpollServerConfig config) {
                 }
                 if (kind == EpollTag::Upstream) {
                     conn->saw_upstream_eof = true;
-                    if (conn->state != ConnState::ReadUpstream && conn->state != ConnState::WriteClient) {
+                    if (conn->state != ConnState::ReadUpstream &&
+                        conn->state != ConnState::WriteClient &&
+                        conn->state != ConnState::SpliceResponseBody) {
                         release_connection(&rt, conn);
                         continue;
                     }
@@ -1272,17 +1428,23 @@ static void worker_loop(EpollServerConfig config) {
                     ok = handle_upstream_write(&rt, conn);
                 } else if (conn->state == ConnState::WriteClient && (event_mask & EPOLLOUT)) {
                     ok = handle_client_write(&rt, conn);
+                } else if (conn->state == ConnState::SpliceResponseBody && (event_mask & EPOLLOUT)) {
+                    ok = handle_splice_response_body(&rt, conn);
                 }
             } else if (kind == EpollTag::Upstream) {
                 const bool upstream_connect_ready = (event_mask & EPOLLOUT) || peer_closed;
                 const bool upstream_read_ready = (event_mask & EPOLLIN) || (conn->saw_upstream_eof &&
                     conn->state == ConnState::ReadUpstream);
+                const bool upstream_splice_ready = (event_mask & EPOLLIN) || (conn->saw_upstream_eof &&
+                    conn->state == ConnState::SpliceResponseBody);
                 if (conn->state == ConnState::ConnectUpstream && upstream_connect_ready) {
                     ok = handle_upstream_connect(&rt, conn);
                 } else if (conn->state == ConnState::WriteUpstream && (event_mask & EPOLLOUT)) {
                     ok = handle_upstream_write(&rt, conn);
                 } else if (conn->state == ConnState::ReadUpstream && upstream_read_ready) {
                     ok = handle_upstream_read(&rt, conn);
+                } else if (conn->state == ConnState::SpliceResponseBody && upstream_splice_ready) {
+                    ok = handle_splice_response_body(&rt, conn);
                 }
             }
             if (!ok) {

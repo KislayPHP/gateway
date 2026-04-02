@@ -18,6 +18,7 @@ enum class ConnState {
     ConnectUpstream,
     WriteUpstream,
     ReadUpstream,
+    SpliceResponseBody,
     WriteClient,
     Done,
     Error
@@ -49,6 +50,7 @@ struct Connection {
     const UpstreamTarget *upstream_target;
     EpollTag client_tag;
     EpollTag upstream_tag;
+    int pipefd[2];
     uint32_t client_events;
     uint32_t upstream_events;
     bool request_parsed;
@@ -61,11 +63,16 @@ struct Connection {
     bool upstream_connected;
     bool saw_client_eof;
     bool saw_upstream_eof;
+    bool splice_enabled;
+    bool pipe_initialized;
+    bool splice_eof;
     bool passthrough_response_headers;
     uint64_t request_body_expected;
     uint64_t request_body_forwarded;
     uint64_t response_body_expected;
     uint64_t response_body_forwarded;
+    uint64_t remaining_bytes;
+    uint32_t pipe_buffered_bytes;
     uint32_t response_header_bytes;
     uint32_t response_header_forwarded;
     uint64_t last_activity_ms;

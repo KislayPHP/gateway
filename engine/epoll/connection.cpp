@@ -11,6 +11,7 @@ Connection::Connection()
       state(ConnState::ReadClientHeaders),
       route(nullptr),
       upstream_target(nullptr),
+      pipefd{-1, -1},
       client_events(0),
       upstream_events(0),
       request_parsed(false),
@@ -23,11 +24,16 @@ Connection::Connection()
       upstream_connected(false),
       saw_client_eof(false),
       saw_upstream_eof(false),
+      splice_enabled(false),
+      pipe_initialized(false),
+      splice_eof(false),
       passthrough_response_headers(false),
       request_body_expected(0),
       request_body_forwarded(0),
       response_body_expected(0),
       response_body_forwarded(0),
+      remaining_bytes(0),
+      pipe_buffered_bytes(0),
       response_header_bytes(0),
       response_header_forwarded(0),
       last_activity_ms(0) {
@@ -62,11 +68,16 @@ void Connection::Reset(int fd) {
     upstream_connected = false;
     saw_client_eof = false;
     saw_upstream_eof = false;
+    splice_enabled = false;
+    pipe_initialized = pipefd[0] >= 0 && pipefd[1] >= 0;
+    splice_eof = false;
     passthrough_response_headers = false;
     request_body_expected = 0;
     request_body_forwarded = 0;
     response_body_expected = 0;
     response_body_forwarded = 0;
+    remaining_bytes = 0;
+    pipe_buffered_bytes = 0;
     response_header_bytes = 0;
     response_header_forwarded = 0;
     request = RequestHead();
