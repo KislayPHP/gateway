@@ -263,6 +263,9 @@ static bool is_hop_header(const char *buffer, const HeaderRef &header) {
 static void queue_error_response(Connection *conn, int status, const char *message, bool close_after) {
     conn->client_buffer.clear();
     conn->safe_upstream_keep_alive = false;
+    conn->passthrough_response_headers = false;
+    conn->response_header_bytes = 0;
+    conn->response_header_forwarded = 0;
     char header[512];
     const char *status_text = "Bad Request";
     switch (status) {
@@ -963,6 +966,26 @@ static bool build_client_response_header(Connection *conn) {
     return true;
 }
 
+static bool can_passthrough_response_headers(const Connection *conn) {
+    if (!conn->client_keep_alive || conn->pipelined_bytes) {
+        return false;
+    }
+    if (conn->response.version_len != 8) {
+        return false;
+    }
+    const char *response_buffer = conn->upstream_buffer.data();
+    if (std::memcmp(response_buffer + conn->response.version_off, "HTTP/1.1", 8) != 0) {
+        return false;
+    }
+    if (conn->response.chunked || conn->response.close_delimited) {
+        return false;
+    }
+    if (!conn->response.has_content_length && !conn->response.no_body) {
+        return false;
+    }
+    return true;
+}
+
 static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
     if (!read_into_buffer(conn->upstream_fd, &conn->upstream_buffer, &conn->saw_upstream_eof)) {
         queue_error_response(conn, 502, "upstream read failed", true);
@@ -990,12 +1013,25 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
             (conn->response.has_content_length || conn->response.no_body) &&
             !conn->response.chunked &&
             !conn->response.close_delimited;
-        conn->safe_client_keep_alive = conn->client_keep_alive && !conn->pipelined_bytes && (conn->response.has_content_length || conn->response.no_body) && !conn->response.chunked && !conn->response.close_delimited;
+        conn->safe_client_keep_alive =
+            conn->client_keep_alive &&
+            conn->response.keep_alive &&
+            !conn->pipelined_bytes &&
+            (conn->response.has_content_length || conn->response.no_body) &&
+            !conn->response.chunked &&
+            !conn->response.close_delimited;
         conn->close_after_response = !conn->safe_client_keep_alive;
-        build_client_response_header(conn);
-        conn->upstream_buffer.start = conn->response.headers_end;
-        if (conn->upstream_buffer.start > conn->upstream_buffer.end) {
-            conn->upstream_buffer.start = conn->upstream_buffer.end;
+        conn->passthrough_response_headers = can_passthrough_response_headers(conn);
+        conn->response_header_bytes = conn->response.headers_end;
+        conn->response_header_forwarded = 0;
+        if (conn->passthrough_response_headers) {
+            conn->client_buffer.clear();
+        } else {
+            build_client_response_header(conn);
+            conn->upstream_buffer.start = conn->response.headers_end;
+            if (conn->upstream_buffer.start > conn->upstream_buffer.end) {
+                conn->upstream_buffer.start = conn->upstream_buffer.end;
+            }
         }
         conn->state = ConnState::WriteClient;
         if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
@@ -1053,7 +1089,15 @@ static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
     }
     const std::size_t body_after = conn->upstream_buffer.readable();
     if (body_before >= body_after) {
-        conn->response_body_forwarded += static_cast<uint64_t>(body_before - body_after);
+        std::size_t upstream_forwarded = body_before - body_after;
+        if (conn->passthrough_response_headers && upstream_forwarded > 0) {
+            const std::size_t header_remaining =
+                static_cast<std::size_t>(conn->response_header_bytes - conn->response_header_forwarded);
+            const std::size_t header_sent = std::min(upstream_forwarded, header_remaining);
+            conn->response_header_forwarded += static_cast<uint32_t>(header_sent);
+            upstream_forwarded -= header_sent;
+        }
+        conn->response_body_forwarded += static_cast<uint64_t>(upstream_forwarded);
     }
 
     if (conn->response_parsed && conn->response.no_body && conn->client_buffer.empty() && conn->upstream_buffer.empty()) {

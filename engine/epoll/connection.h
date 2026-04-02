@@ -61,10 +61,13 @@ struct Connection {
     bool upstream_connected;
     bool saw_client_eof;
     bool saw_upstream_eof;
+    bool passthrough_response_headers;
     uint64_t request_body_expected;
     uint64_t request_body_forwarded;
     uint64_t response_body_expected;
     uint64_t response_body_forwarded;
+    uint32_t response_header_bytes;
+    uint32_t response_header_forwarded;
     uint64_t last_activity_ms;
 
     Connection();
