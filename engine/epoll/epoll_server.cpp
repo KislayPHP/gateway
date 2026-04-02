@@ -17,6 +17,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/resource.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #endif
@@ -67,6 +68,18 @@ static uint32_t fnv1a32(const char *data, std::size_t len) {
         hash *= 16777619u;
     }
     return hash;
+}
+
+static void raise_nofile_limit() {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        return;
+    }
+    if (limit.rlim_cur == limit.rlim_max) {
+        return;
+    }
+    limit.rlim_cur = limit.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &limit);
 }
 
 static void close_fd(int &fd) {
@@ -1241,6 +1254,7 @@ bool EpollServer::Start(std::string *error_out) {
         return false;
     }
     config_.snapshot.Finalize();
+    raise_nofile_limit();
     workers_.clear();
     for (int i = 0; i < config_.worker_processes; ++i) {
         const pid_t pid = fork();
