@@ -5,6 +5,7 @@ extern "C" {
 }
 
 #include "php_kislayphp_gateway.h"
+#include "engine/epoll/epoll_server.h"
 
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
@@ -86,6 +87,7 @@ typedef struct _php_kislayphp_gateway_t {
     zend_long circuit_failure_threshold;
     zend_long circuit_open_seconds;
     std::unordered_map<std::string, kislayphp_circuit_state> circuit_states;
+    std::unique_ptr<kislay::gateway::epoll::EpollServer> epoll_server;
     zend_object std;
 } php_kislayphp_gateway_t;
 
@@ -326,6 +328,7 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->auth_user_header) std::string();
     new (&obj->rate_limits) std::unordered_map<std::string, kislayphp_rate_limit_entry>();
     new (&obj->circuit_states) std::unordered_map<std::string, kislayphp_circuit_state>();
+    new (&obj->epoll_server) std::unique_ptr<kislay::gateway::epoll::EpollServer>();
     obj->ctx = nullptr;
     obj->running = false;
     obj->has_fallback = false;
@@ -373,9 +376,14 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
         mg_stop(obj->ctx);
         obj->ctx = nullptr;
     }
+    if (obj->epoll_server) {
+        obj->epoll_server->Stop();
+        obj->epoll_server.reset();
+    }
     if (obj->has_resolver) {
         zval_ptr_dtor(&obj->resolver);
     }
+    obj->epoll_server.~unique_ptr();
     obj->native_services.~shared_ptr();
     obj->circuit_states.~unordered_map();
     obj->rate_limits.~unordered_map();
@@ -536,6 +544,89 @@ static bool kislayphp_resolve_native_service(php_kislayphp_gateway_t *gateway,
     const std::shared_ptr<kislayphp_native_service_entry> &entry = it->second;
     const uint32_t slot = entry->next_index.fetch_add(1, std::memory_order_relaxed);
     *resolved = entry->targets[slot % entry->targets.size()];
+    return true;
+}
+
+static bool kislayphp_build_epoll_config(php_kislayphp_gateway_t *gateway,
+                                         const char *host,
+                                         size_t host_len,
+                                         zend_long port,
+                                         kislay::gateway::epoll::EpollServerConfig *config,
+                                         std::string *error_out) {
+    if (gateway == nullptr || config == nullptr) {
+        if (error_out != nullptr) {
+            *error_out = "invalid epoll gateway configuration";
+        }
+        return false;
+    }
+    if (gateway->auth_required || gateway->rate_limit_enabled || gateway->circuit_breaker_enabled ||
+        !gateway->jwt_secret.empty()) {
+        if (error_out != nullptr) {
+            *error_out = "epoll engine currently supports routing and proxying only; auth, rate limit, and circuit breaker stay on CivetWeb";
+        }
+        return false;
+    }
+    if (gateway->has_resolver) {
+        if (error_out != nullptr) {
+            *error_out = "epoll engine does not support PHP resolvers; use registerService()";
+        }
+        return false;
+    }
+
+    config->listen_host.assign(host, host_len);
+    config->listen_port = static_cast<uint16_t>(port);
+    config->worker_processes = gateway->thread_count > 0 ? gateway->thread_count : 1;
+    config->max_body_bytes = gateway->max_body_bytes;
+
+    std::lock_guard<std::mutex> guard(gateway->lock);
+    for (std::size_t i = 0; i < gateway->routes.size(); ++i) {
+        const kislayphp_gateway_route &route = gateway->routes[i];
+        kislay::gateway::epoll::ControlRoute cp_route;
+        cp_route.method = route.method;
+        cp_route.path = route.path;
+        cp_route.use_service = route.use_service;
+        cp_route.service = route.service;
+        cp_route.target.host = route.host;
+        cp_route.target.port = static_cast<uint16_t>(route.port);
+        cp_route.target.use_tls = route.use_tls;
+        cp_route.target.base_path = route.base_path;
+        config->snapshot.AddRoute(cp_route);
+    }
+    if (gateway->has_fallback) {
+        kislay::gateway::epoll::ControlRoute fallback;
+        fallback.method = gateway->fallback_route.method;
+        fallback.path = gateway->fallback_route.path;
+        fallback.use_service = gateway->fallback_route.use_service;
+        fallback.service = gateway->fallback_route.service;
+        fallback.target.host = gateway->fallback_route.host;
+        fallback.target.port = static_cast<uint16_t>(gateway->fallback_route.port);
+        fallback.target.use_tls = gateway->fallback_route.use_tls;
+        fallback.target.base_path = gateway->fallback_route.base_path;
+        config->snapshot.SetFallback(fallback);
+    }
+
+    std::shared_ptr<kislayphp_native_service_registry> current = std::atomic_load(&gateway->native_services);
+    if (current) {
+        for (kislayphp_native_service_registry::const_iterator it = current->begin(); it != current->end(); ++it) {
+            if (!it->second) {
+                continue;
+            }
+            kislay::gateway::epoll::ServiceRegistryEntry service_entry;
+            service_entry.service = it->first;
+            service_entry.targets.reserve(it->second->targets.size());
+            for (std::size_t target_idx = 0; target_idx < it->second->targets.size(); ++target_idx) {
+                const kislayphp_gateway_route &target_route = it->second->targets[target_idx];
+                kislay::gateway::epoll::UpstreamTarget target;
+                target.host = target_route.host;
+                target.port = static_cast<uint16_t>(target_route.port);
+                target.use_tls = target_route.use_tls;
+                target.base_path = target_route.base_path;
+                service_entry.targets.push_back(target);
+            }
+            config->snapshot.AddService(service_entry);
+        }
+    }
+    config->snapshot.Finalize();
     return true;
 }
 
@@ -1614,6 +1705,29 @@ PHP_METHOD(KislayPHPGateway, listen) {
     kislayphp_disable_stack_guard_for_nts("Kislay\\Gateway\\Gateway::listen");
     obj->thread_count = kislayphp_sanitize_thread_count(obj->thread_count, "Kislay\\Gateway\\Gateway::listen");
 
+    const std::string engine = kislayphp_env_string("KISLAY_GATEWAY_ENGINE", "civetweb");
+    if (engine == "epoll") {
+#ifndef __linux__
+        zend_throw_exception(zend_ce_exception, "epoll gateway engine is Linux-only", 0);
+        RETURN_FALSE;
+#else
+        std::string error;
+        kislay::gateway::epoll::EpollServerConfig config;
+        if (!kislayphp_build_epoll_config(obj, host, host_len, port, &config, &error)) {
+            zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+            RETURN_FALSE;
+        }
+        obj->epoll_server.reset(new kislay::gateway::epoll::EpollServer(config));
+        if (!obj->epoll_server->Start(&error)) {
+            obj->epoll_server.reset();
+            zend_throw_exception(zend_ce_exception, error.empty() ? "Failed to start epoll gateway" : error.c_str(), 0);
+            RETURN_FALSE;
+        }
+        obj->running = true;
+        RETURN_TRUE;
+#endif
+    }
+
     std::string listen_addr = std::string(host, host_len) + ":" + std::to_string(port);
     std::vector<const char *> options;
     options.push_back("listening_ports");
@@ -1687,6 +1801,10 @@ PHP_METHOD(KislayPHPGateway, setFallbackService) {
 PHP_METHOD(KislayPHPGateway, stop) {
     php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
     obj->running = false;
+    if (obj->epoll_server) {
+        obj->epoll_server->Stop();
+        obj->epoll_server.reset();
+    }
     if (obj->ctx != nullptr) {
         mg_stop(obj->ctx);
         obj->ctx = nullptr;
