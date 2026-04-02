@@ -11,6 +11,8 @@ Connection::Connection()
       state(ConnState::ReadClientHeaders),
       route(nullptr),
       upstream_target(nullptr),
+      client_events(0),
+      upstream_events(0),
       request_parsed(false),
       response_parsed(false),
       client_keep_alive(false),
@@ -26,10 +28,8 @@ Connection::Connection()
       response_body_expected(0),
       response_body_forwarded(0),
       last_activity_ms(0) {
-    std::memset(&request, 0, sizeof(request));
-    std::memset(&response, 0, sizeof(response));
-    std::memset(request_headers, 0, sizeof(request_headers));
-    std::memset(response_headers, 0, sizeof(response_headers));
+    request = RequestHead();
+    response = ResponseHead();
     client_tag.kind = EpollTag::Client;
     client_tag.conn = this;
     upstream_tag.kind = EpollTag::Upstream;
@@ -47,6 +47,8 @@ void Connection::Reset(int fd) {
     upstream_buffer.clear();
     route = nullptr;
     upstream_target = nullptr;
+    client_events = 0;
+    upstream_events = 0;
     request_parsed = false;
     response_parsed = false;
     client_keep_alive = false;
@@ -61,10 +63,8 @@ void Connection::Reset(int fd) {
     request_body_forwarded = 0;
     response_body_expected = 0;
     response_body_forwarded = 0;
-    std::memset(&request, 0, sizeof(request));
-    std::memset(&response, 0, sizeof(response));
-    std::memset(request_headers, 0, sizeof(request_headers));
-    std::memset(response_headers, 0, sizeof(response_headers));
+    request = RequestHead();
+    response = ResponseHead();
 }
 
 void Connection::ResetForNextRequest() {

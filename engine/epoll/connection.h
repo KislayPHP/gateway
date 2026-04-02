@@ -49,6 +49,8 @@ struct Connection {
     const UpstreamTarget *upstream_target;
     EpollTag client_tag;
     EpollTag upstream_tag;
+    uint32_t client_events;
+    uint32_t upstream_events;
     bool request_parsed;
     bool response_parsed;
     bool client_keep_alive;

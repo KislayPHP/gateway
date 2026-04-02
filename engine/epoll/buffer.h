@@ -72,6 +72,13 @@ struct FixedBuffer {
         end -= start;
         start = 0;
     }
+
+    void compact_if_needed(std::size_t need = 1) {
+        if (writable() >= need) {
+            return;
+        }
+        compact();
+    }
 };
 
 } // namespace epoll

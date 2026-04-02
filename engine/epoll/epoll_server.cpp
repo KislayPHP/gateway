@@ -461,6 +461,46 @@ static uint32_t token_index(uint64_t token) {
     return static_cast<uint32_t>(token & 0x0FFFFFFFu);
 }
 
+static uint32_t desired_client_events(const Connection *conn) {
+    uint32_t events = EPOLLET | EPOLLRDHUP;
+    switch (conn->state) {
+        case ConnState::ReadClientHeaders:
+            events |= EPOLLIN;
+            break;
+        case ConnState::WriteUpstream:
+            if (conn->request_body_forwarded < conn->request_body_expected && conn->client_buffer.writable() > 0) {
+                events |= EPOLLIN;
+            }
+            break;
+        case ConnState::WriteClient:
+            if (!conn->client_buffer.empty() || !conn->upstream_buffer.empty()) {
+                events |= EPOLLOUT;
+            }
+            break;
+        default:
+            break;
+    }
+    return events;
+}
+
+static uint32_t desired_upstream_events(const Connection *conn) {
+    uint32_t events = EPOLLET | EPOLLRDHUP;
+    switch (conn->state) {
+        case ConnState::ConnectUpstream:
+        case ConnState::WriteUpstream:
+            events |= EPOLLOUT;
+            break;
+        case ConnState::ReadUpstream:
+            if (conn->upstream_buffer.writable() > 0) {
+                events |= EPOLLIN;
+            }
+            break;
+        default:
+            break;
+    }
+    return events;
+}
+
 static bool arm_error_response(WorkerRuntime *rt, Connection *conn) {
     conn->state = ConnState::WriteClient;
     return refresh_client_interest(rt, conn) && refresh_upstream_interest(rt, conn);
@@ -501,54 +541,42 @@ static void release_connection(WorkerRuntime *rt, Connection *conn) {
 }
 
 static bool refresh_client_interest(WorkerRuntime *rt, Connection *conn) {
-    uint32_t events = EPOLLET;
-    switch (conn->state) {
-        case ConnState::ReadClientHeaders:
-            events |= EPOLLIN;
-            break;
-        case ConnState::WriteUpstream:
-            if (conn->request_body_forwarded < conn->request_body_expected && conn->client_buffer.writable() > 0) {
-                events |= EPOLLIN;
-            }
-            break;
-        case ConnState::WriteClient:
-            if (!conn->client_buffer.empty() || !conn->upstream_buffer.empty()) {
-                events |= EPOLLOUT;
-            }
-            break;
-        default:
-            break;
+    if (conn->client_fd < 0) {
+        return true;
     }
-    return epoll_mod(rt->epoll_fd, conn->client_fd, events,
-                     make_conn_token(EpollTag::Client, conn->generation, connection_index(rt, conn)));
+    const uint32_t events = desired_client_events(conn);
+    if (events == conn->client_events) {
+        return true;
+    }
+    if (!epoll_mod(rt->epoll_fd, conn->client_fd, events,
+                   make_conn_token(EpollTag::Client, conn->generation, connection_index(rt, conn)))) {
+        return false;
+    }
+    conn->client_events = events;
+    return true;
 }
 
 static bool refresh_upstream_interest(WorkerRuntime *rt, Connection *conn) {
     if (conn->upstream_fd < 0) {
         return true;
     }
-    uint32_t events = EPOLLET | EPOLLRDHUP;
-    switch (conn->state) {
-        case ConnState::ConnectUpstream:
-        case ConnState::WriteUpstream:
-            events |= EPOLLOUT;
-            break;
-        case ConnState::ReadUpstream:
-            if (conn->upstream_buffer.writable() > 0) {
-                events |= EPOLLIN;
-            }
-            break;
-        default:
-            break;
+    const uint32_t events = desired_upstream_events(conn);
+    if (events == conn->upstream_events) {
+        return true;
     }
-    return epoll_mod(rt->epoll_fd, conn->upstream_fd, events,
-                     make_conn_token(EpollTag::Upstream, conn->generation, connection_index(rt, conn)));
+    if (!epoll_mod(rt->epoll_fd, conn->upstream_fd, events,
+                   make_conn_token(EpollTag::Upstream, conn->generation, connection_index(rt, conn)))) {
+        return false;
+    }
+    conn->upstream_events = events;
+    return true;
 }
 
 static void close_upstream_side(WorkerRuntime *rt, Connection *conn) {
     if (conn->upstream_fd >= 0) {
         epoll_del(rt->epoll_fd, conn->upstream_fd);
         close_fd(conn->upstream_fd);
+        conn->upstream_events = 0;
     }
 }
 
@@ -644,6 +672,7 @@ static void recycle_upstream_side(WorkerRuntime *rt, Connection *conn) {
     const int fd = conn->upstream_fd;
     epoll_del(rt->epoll_fd, fd);
     conn->upstream_fd = -1;
+    conn->upstream_events = 0;
 
     if (!safe_to_reuse || !pooled_socket_healthy(fd)) {
         int doomed = fd;
@@ -687,12 +716,14 @@ static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
         conn->upstream_fd = fd;
         conn->upstream_connected = true;
         conn->state = ConnState::WriteUpstream;
-        if (!epoll_add(rt->epoll_fd, conn->upstream_fd, EPOLLET | EPOLLOUT | EPOLLRDHUP,
+        const uint32_t events = desired_upstream_events(conn);
+        if (!epoll_add(rt->epoll_fd, conn->upstream_fd, events,
                        make_conn_token(EpollTag::Upstream, conn->generation, connection_index(rt, conn)))) {
             close_fd(conn->upstream_fd);
             queue_error_response(conn, 502, "Upstream reuse failed", true);
             return false;
         }
+        conn->upstream_events = events;
         return handle_upstream_write(rt, conn);
     }
 
@@ -718,12 +749,14 @@ static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
     }
     conn->upstream_fd = fd;
     conn->state = ConnState::ConnectUpstream;
-    if (!epoll_add(rt->epoll_fd, conn->upstream_fd, EPOLLET | EPOLLOUT | EPOLLRDHUP,
+    const uint32_t events = desired_upstream_events(conn);
+    if (!epoll_add(rt->epoll_fd, conn->upstream_fd, events,
                    make_conn_token(EpollTag::Upstream, conn->generation, connection_index(rt, conn)))) {
         close_fd(conn->upstream_fd);
         queue_error_response(conn, 502, "Upstream connect failed", true);
         return false;
     }
+    conn->upstream_events = events;
     if (rc == 0) {
         conn->upstream_connected = true;
         conn->state = ConnState::WriteUpstream;
@@ -776,8 +809,8 @@ static bool flush_iov(int fd, FixedBuffer<32768> *first, FixedBuffer<32768> *sec
 }
 
 static bool read_into_buffer(int fd, FixedBuffer<32768> *buffer, bool *saw_eof) {
-    buffer->compact();
     for (;;) {
+        buffer->compact_if_needed();
         if (buffer->writable() == 0) {
             return true;
         }
@@ -867,7 +900,7 @@ static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
 
     while (conn->request_body_forwarded < conn->request_body_expected && conn->client_buffer.empty()) {
         const uint64_t remain = conn->request_body_expected - conn->request_body_forwarded;
-        conn->client_buffer.compact();
+        conn->client_buffer.compact_if_needed();
         const std::size_t want = static_cast<std::size_t>(std::min<uint64_t>(conn->client_buffer.writable(), remain));
         if (want == 0) {
             break;
@@ -1122,11 +1155,13 @@ static void worker_loop(EpollServerConfig config) {
                     Connection &conn = rt.connections[idx];
                     conn.Reset(fd);
                     conn.last_activity_ms = now;
-                    if (!epoll_add(rt.epoll_fd, conn.client_fd, EPOLLIN | EPOLLET,
+                    const uint32_t events = desired_client_events(&conn);
+                    if (!epoll_add(rt.epoll_fd, conn.client_fd, events,
                                    make_conn_token(EpollTag::Client, conn.generation, idx))) {
                         release_connection(&rt, &conn);
                         continue;
                     }
+                    conn.client_events = events;
                     if (!handle_client_header_read(&rt, &conn)) {
                         release_connection(&rt, &conn);
                         continue;
@@ -1197,12 +1232,12 @@ static void worker_loop(EpollServerConfig config) {
             } else if (kind == EpollTag::Upstream) {
                 const bool upstream_connect_ready = (event_mask & EPOLLOUT) || peer_closed;
                 const bool upstream_read_ready = (event_mask & EPOLLIN) || (conn->saw_upstream_eof &&
-                    (conn->state == ConnState::ReadUpstream || conn->state == ConnState::WriteClient));
+                    conn->state == ConnState::ReadUpstream);
                 if (conn->state == ConnState::ConnectUpstream && upstream_connect_ready) {
                     ok = handle_upstream_connect(&rt, conn);
                 } else if (conn->state == ConnState::WriteUpstream && (event_mask & EPOLLOUT)) {
                     ok = handle_upstream_write(&rt, conn);
-                } else if ((conn->state == ConnState::ReadUpstream || conn->state == ConnState::WriteClient) && upstream_read_ready) {
+                } else if (conn->state == ConnState::ReadUpstream && upstream_read_ready) {
                     ok = handle_upstream_read(&rt, conn);
                 }
             }
