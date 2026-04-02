@@ -282,34 +282,45 @@ static void queue_error_response(Connection *conn, int status, const char *messa
     conn->response_body_forwarded = 0;
 }
 
-static std::string join_target_path(const UpstreamTarget *target, const RequestHead &request, const char *request_buffer) {
-    std::string path = target->base_path.empty() ? "/" : target->base_path;
+static void append_target_path(FixedBuffer<32768> &buffer,
+                               const UpstreamTarget *target,
+                               const RequestHead &request,
+                               const char *request_buffer) {
+    const std::string &base = target->base_path;
     const char *req_path = request_buffer + request.path_off;
+
+    if (base.empty()) {
+        append_literal(buffer, "/");
+    } else {
+        append_bytes(buffer, base.data(), base.size());
+    }
+
     if (request.path_len > 0) {
-        if (!path.empty() && path[path.size() - 1] == '/' && req_path[0] == '/') {
-            path.append(req_path + 1, request.path_len - 1);
-        } else if (!path.empty() && path[path.size() - 1] != '/' && req_path[0] != '/') {
-            path.push_back('/');
-            path.append(req_path, request.path_len);
+        const bool base_has_slash = !base.empty() && base[base.size() - 1] == '/';
+        const bool req_has_slash = req_path[0] == '/';
+        if (base_has_slash && req_has_slash) {
+            append_bytes(buffer, req_path + 1, request.path_len - 1);
+        } else if (!base_has_slash && !req_has_slash) {
+            append_literal(buffer, "/");
+            append_bytes(buffer, req_path, request.path_len);
         } else {
-            path.append(req_path, request.path_len);
+            append_bytes(buffer, req_path, request.path_len);
         }
     }
+
     if (request.query_len > 0) {
-        path.push_back('?');
-        path.append(request_buffer + request.query_off, request.query_len);
+        append_literal(buffer, "?");
+        append_bytes(buffer, request_buffer + request.query_off, request.query_len);
     }
-    return path;
 }
 
 static bool build_upstream_request(Connection *conn, std::string *error_out) {
     conn->upstream_buffer.clear();
     const char *request_buffer = conn->client_buffer.data();
-    std::string target_path = join_target_path(conn->upstream_target, conn->request, request_buffer);
 
     append_bytes(conn->upstream_buffer, request_buffer + conn->request.method_off, conn->request.method_len);
     append_literal(conn->upstream_buffer, " ");
-    append_bytes(conn->upstream_buffer, target_path.data(), target_path.size());
+    append_target_path(conn->upstream_buffer, conn->upstream_target, conn->request, request_buffer);
     append_literal(conn->upstream_buffer, " HTTP/1.1\r\nHost: ");
     append_bytes(conn->upstream_buffer, conn->upstream_target->host.data(), conn->upstream_target->host.size());
     append_literal(conn->upstream_buffer, ":");
