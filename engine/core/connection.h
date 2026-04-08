@@ -9,7 +9,7 @@
 
 namespace kislay {
 namespace gateway {
-namespace epoll {
+namespace core {
 
 enum class ConnState {
     ReadClientHeaders = 0,
@@ -26,7 +26,7 @@ enum class ConnState {
 
 struct Connection;
 
-struct EpollTag {
+struct CoreTag {
     enum Kind {
         Listener = 0,
         Client,
@@ -52,8 +52,8 @@ struct Connection {
     HeaderRef response_headers[64];
     const RouteSnapshotEntry *route;
     const UpstreamTarget *upstream_target;
-    EpollTag client_tag;
-    EpollTag upstream_tag;
+    CoreTag client_tag;
+    CoreTag upstream_tag;
     int pipefd[2];
     uint32_t pipe_buffered_bytes;
     uint32_t pipe_capacity_bytes;
@@ -90,6 +90,6 @@ struct Connection {
     void ResetForNextRequest();
 };
 
-} // namespace epoll
+} // namespace core
 } // namespace gateway
 } // namespace kislay

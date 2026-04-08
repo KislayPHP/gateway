@@ -7,7 +7,7 @@
 
 namespace kislay {
 namespace gateway {
-namespace epoll {
+namespace core {
 namespace {
 
 const char *kInvalidRequestLine = "invalid request line";
@@ -404,6 +404,6 @@ ParseStatus ParseResponseHead(const char *buffer,
     return ParseStatus::Ok;
 }
 
-} // namespace epoll
+} // namespace core
 } // namespace gateway
 } // namespace kislay

@@ -2,7 +2,7 @@
 
 namespace kislay {
 namespace gateway {
-namespace epoll {
+namespace core {
 
 Connection::Connection()
     : generation(0),
@@ -47,9 +47,9 @@ Connection::Connection()
       last_progress_ms(0) {
     request = RequestHead();
     response = ResponseHead();
-    client_tag.kind = EpollTag::Client;
+    client_tag.kind = CoreTag::Client;
     client_tag.conn = this;
-    upstream_tag.kind = EpollTag::Upstream;
+    upstream_tag.kind = CoreTag::Upstream;
     upstream_tag.conn = this;
 }
 
@@ -116,6 +116,6 @@ void Connection::ResetForNextRequest() {
     last_progress_ms = last_progress;
 }
 
-} // namespace epoll
+} // namespace core
 } // namespace gateway
 } // namespace kislay

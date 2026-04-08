@@ -18,6 +18,32 @@ Do not use it to duplicate:
 - Core async HTTP execution
 - business logic
 
+## Runtime engines
+
+Gateway supports two runtime modes:
+
+- default legacy CivetWeb path
+- native event-loop data plane when `KISLAY_GATEWAY_ENGINE=auto`, `epoll`, or `kqueue`
+
+The native path is the high-performance data plane. It keeps PHP out of the request hot path and uses:
+
+- per-worker process isolation with `SO_REUSEPORT`
+- non-blocking sockets
+- progress-based timeout enforcement
+- raw upstream header passthrough when safe
+- gated `splice()` zero-copy body forwarding when safe on Linux
+
+Platform support:
+
+- Linux: production target
+- macOS: native `kqueue` runtime supported for the same shared proxy engine
+
+Native worker selection:
+
+- if `KISLAY_GATEWAY_THREADS` is unset, the native engine defaults to `CPU * 2`
+- `setThreads(0)` also means native auto-scaling
+- the legacy CivetWeb path still normalizes invalid thread counts to `1`
+
 ## Namespace
 
 - Primary: `Kislay\Gateway\Gateway`
@@ -62,6 +88,14 @@ For production, prefer `registerService()` because it keeps service routing off 
 
 ### `listen(string $host, int $port): bool`
 Starts the gateway listener and returns after startup.
+
+This remains the production API in `0.0.x`.
+
+Startup contract:
+
+- call `addRoute()`, `addServiceRoute()`, `registerService()`, `setResolver()`, fallback setters, and auth setters before `listen()`
+- `listen()` freezes configuration into the active runtime
+- configuration methods reject changes after startup
 
 ### `stop(): bool`
 Stops the listener.
@@ -138,7 +172,43 @@ Client identity:
 - On NTS builds, thread count is forced to `1`.
 - On ZTS builds, direct target routes can use request threads, but PHP resolvers are rejected.
 - Gateway remains synchronous in its proxy path by design; Core owns the async execution engine.
+- Configuration is startup-only. Runtime workers do not re-read PHP state after `listen()`.
 - Direct upstream targets reuse thread-local upstream connections when the upstream response is safely framed.
+- Native mode currently supports direct target routes only.
+- Native mode does not yet support HTTP/2, HTTP/3, or fully optimized TLS upstream handling.
+
+## Observability
+
+For the native data plane, set:
+
+```bash
+export KISLAY_GATEWAY_EPOLL_STATS=1
+```
+
+This emits per-worker counters without global locking, including:
+
+- `total_requests`
+- `active_connections`
+- `peak_active_connections`
+- `errors`
+- `timeouts`
+- `rejected_connections`
+- `splice_hits`
+- `splice_fallbacks`
+- `header_passthrough_hits`
+
+## Positioning
+
+Document Gateway as:
+
+- a programmable high-performance gateway
+- a native event-loop data plane with Linux `epoll` and macOS `kqueue`
+- an internal service gateway / API routing layer / AI platform gateway
+
+Do not document it as:
+
+- an NGINX replacement
+- the fastest proxy
 
 ## Example
 

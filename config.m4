@@ -13,6 +13,9 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
   PHP_ADD_LIBRARY(stdc++,, KISLAYPHP_GATEWAY_SHARED_LIBADD)
   PHP_SUBST(KISLAYPHP_GATEWAY_SHARED_LIBADD)
   PHP_ADD_INCLUDE(`pwd`/engine/epoll)
+  PHP_ADD_INCLUDE(`pwd`/engine/core)
+  PHP_ADD_INCLUDE(`pwd`/engine/interface)
+  PHP_ADD_INCLUDE(`pwd`/engine/kqueue)
 
   CFLAGS="$CFLAGS -DOPENSSL_API_3_0"
   CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0"
@@ -30,7 +33,7 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
     RPC_SRCS=""
   fi
 
-  EPOLL_SRCS="engine/epoll/epoll_server.cpp engine/epoll/connection.cpp engine/epoll/http_parser.cpp"
+  EPOLL_SRCS="engine/core/connection.cpp engine/core/http_parser.cpp engine/core/proxy_engine.cpp engine/epoll/epoll_loop.cpp engine/kqueue/kqueue_loop.cpp engine/epoll/epoll_server.cpp"
 
   PHP_NEW_EXTENSION(kislayphp_gateway, kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $EPOLL_SRCS $RPC_SRCS, $ext_shared)
 fi
