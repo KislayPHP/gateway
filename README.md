@@ -137,7 +137,7 @@ Gateway keeps resilience lightweight:
 - read timeout on upstream responses
 - retry only for idempotent methods and only on pre-response upstream failures
 - simple per-upstream circuit breaker with `CLOSED / OPEN / HALF_OPEN`
-- native direct-route resolver snapshots and per-worker isolation
+- native route snapshots and per-worker isolation
 
 ### Native data plane
 
@@ -147,12 +147,14 @@ With `KISLAY_GATEWAY_ENGINE=auto` or an explicit native loop, the native data pl
 - non-blocking upstream proxying
 - progress-based timeout enforcement
 - rebuilt client-facing response headers with explicit connection semantics
+- safe upstream keep-alive reuse for fixed-length and no-body responses
 - gated `splice()` body streaming for large, fixed-length responses on Linux
 - per-worker counters with no global locks
 
 Current native-path scope is intentionally narrower than the legacy path:
 
-- direct target routes only
+- direct target routes
+- service routes backed by native `registerService()` snapshots
 - HTTP/1.1 only
 - no HTTP/2 or HTTP/3
 - no TLS upstream optimization yet
@@ -185,6 +187,7 @@ Current native-path scope is intentionally narrower than the legacy path:
 - `listen()` is the configuration freeze point. After startup, runtime workers use the native snapshot and config mutation APIs reject changes.
 - Retry is intentionally narrow. Gateway is not a replacement for Core's async execution layer.
 - `registerService()` is the recommended production service discovery path. It publishes a native registry snapshot and avoids PHP callbacks on the request path.
+- Native direct and native `registerService()` service routes use the same event-loop proxy path. PHP resolvers remain disabled on the native engine.
 - On ZTS builds, PHP resolvers are rejected at `listen()` time. Use Discovery RPC or direct targets there.
 - Rate limiting currently uses in-memory storage.
 - Do not position Gateway as an NGINX replacement. Position it as a programmable high-performance gateway with a native event-loop data plane.

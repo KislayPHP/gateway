@@ -73,6 +73,7 @@ static const uint64_t kUpstreamResponseTimeoutMs = 30000ull;
 static const uint64_t kClientWriteTimeoutMs = 30000ull;
 static const uint64_t kIdleKeepAliveTimeoutMs = 15000ull;
 static const uint64_t kUpstreamPoolIdleTimeoutMs = 15000ull;
+static const std::size_t kMaxIdleUpstreamsPerKey = 8u;
 
 enum class TimeoutKind {
     None = 0,
@@ -566,25 +567,60 @@ static bool pooled_socket_healthy(int fd) {
 }
 
 static int acquire_upstream_from_pool(WorkerRuntime *rt, const UpstreamTarget *target) {
-    (void) rt;
-    (void) target;
+    if (rt == nullptr || target == nullptr) {
+        return -1;
+    }
+    const WorkerRuntime::PoolKey key = pool_key_for(target);
+    std::unordered_map<WorkerRuntime::PoolKey, std::deque<WorkerRuntime::PooledUpstream>, WorkerRuntime::PoolKeyHash>::iterator it =
+        rt->upstream_pool.find(key);
+    if (it == rt->upstream_pool.end()) {
+        return -1;
+    }
+    std::deque<WorkerRuntime::PooledUpstream> &bucket = it->second;
+    while (!bucket.empty()) {
+        const WorkerRuntime::PooledUpstream pooled = bucket.back();
+        bucket.pop_back();
+        if (pooled.fd < 0) {
+            continue;
+        }
+        if (!pooled_socket_healthy(pooled.fd)) {
+            int doomed = pooled.fd;
+            close_fd(doomed);
+            continue;
+        }
+        if (bucket.empty()) {
+            rt->upstream_pool.erase(it);
+        }
+        return pooled.fd;
+    }
+    rt->upstream_pool.erase(it);
     return -1;
 }
 
 static void recycle_upstream_side(WorkerRuntime *rt, Connection *conn) {
-    (void) rt;
     if (conn->upstream_fd < 0) {
         return;
     }
-    int doomed = conn->upstream_fd;
+    int reusable = conn->upstream_fd;
     if (conn->upstream_registered) {
-        loop_del(rt, doomed);
+        loop_del(rt, reusable);
         conn->upstream_registered = false;
         conn->upstream_token_generation = 0;
     }
     conn->upstream_fd = -1;
     conn->upstream_events = 0;
-    close_fd(doomed);
+    if (!conn->safe_upstream_keep_alive || conn->upstream_target == nullptr || !pooled_socket_healthy(reusable)) {
+        close_fd(reusable);
+        return;
+    }
+    WorkerRuntime::PoolKey key = pool_key_for(conn->upstream_target);
+    std::deque<WorkerRuntime::PooledUpstream> &bucket = rt->upstream_pool[key];
+    bucket.push_back(WorkerRuntime::PooledUpstream(reusable, now_ms()));
+    while (bucket.size() > kMaxIdleUpstreamsPerKey) {
+        int doomed = bucket.front().fd;
+        bucket.pop_front();
+        close_fd(doomed);
+    }
 }
 
 static void reap_stale_upstream_pool(WorkerRuntime *rt, uint64_t now) {
@@ -707,7 +743,7 @@ static bool build_upstream_request(Connection *conn, std::string *error_out) {
     append_bytes(conn->upstream_buffer, conn->upstream_target->host.data(), conn->upstream_target->host.size());
     append_literal(conn->upstream_buffer, ":");
     append_uint(conn->upstream_buffer, conn->upstream_target->port);
-    append_literal(conn->upstream_buffer, "\r\nConnection: close\r\n");
+    append_literal(conn->upstream_buffer, "\r\nConnection: keep-alive\r\n");
 
     for (uint16_t i = 0; i < conn->request.header_count; ++i) {
         const HeaderRef &header = conn->request_headers[i];
@@ -1201,7 +1237,11 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
         }
         conn->response_parsed = true;
         conn->response_body_expected = conn->response.has_content_length ? conn->response.content_length : 0;
-        conn->safe_upstream_keep_alive = false;
+        conn->safe_upstream_keep_alive =
+            conn->response.keep_alive &&
+            (conn->response.has_content_length || conn->response.no_body) &&
+            !conn->response.chunked &&
+            !conn->response.close_delimited;
         conn->safe_client_keep_alive =
             conn->client_keep_alive &&
             !conn->pipelined_bytes &&
