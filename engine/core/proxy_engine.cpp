@@ -531,25 +531,6 @@ static bool pooled_socket_healthy(int fd) {
         return false;
     }
 
-    struct pollfd pfd;
-    std::memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = fd;
-    pfd.events = POLLIN | POLLERR | POLLHUP;
-#ifdef POLLRDHUP
-    pfd.events |= POLLRDHUP;
-#endif
-    const int poll_rc = poll(&pfd, 1, 0);
-    if (poll_rc < 0) {
-        return false;
-    }
-    if (poll_rc > 0 && (pfd.revents & (POLLERR | POLLHUP
-#ifdef POLLRDHUP
-        | POLLRDHUP
-#endif
-        | POLLNVAL | POLLIN)) != 0) {
-        return false;
-    }
-
     char probe = 0;
     for (;;) {
         const ssize_t n = recv(fd, &probe, sizeof(probe), MSG_PEEK | MSG_DONTWAIT);
@@ -609,7 +590,7 @@ static void recycle_upstream_side(WorkerRuntime *rt, Connection *conn) {
     }
     conn->upstream_fd = -1;
     conn->upstream_events = 0;
-    if (!conn->safe_upstream_keep_alive || conn->upstream_target == nullptr || !pooled_socket_healthy(reusable)) {
+    if (!conn->safe_upstream_keep_alive || conn->upstream_target == nullptr) {
         close_fd(reusable);
         return;
     }

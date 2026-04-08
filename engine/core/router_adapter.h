@@ -36,7 +36,10 @@ struct RouteSnapshotEntry {
     bool wildcard;
     bool use_service;
     std::string service;
+    const ServiceRegistryEntry *service_entry;
     UpstreamTarget target;
+
+    RouteSnapshotEntry() : wildcard(false), use_service(false), service_entry(nullptr) {}
 };
 
 class RouteSnapshot {
@@ -75,12 +78,14 @@ public:
         prefix_.clear();
         for (std::size_t i = 0; i < routes_.size(); ++i) {
             RouteSnapshotEntry &entry = routes_[i];
+            entry.service_entry = bind_service(entry);
             if (!entry.wildcard && entry.method != "*") {
                 exact_[HashPair(entry.method.data(), entry.method.size(), entry.path.data(), entry.path.size())] = &entry;
             } else {
                 prefix_.push_back(&entry);
             }
         }
+        fallback_.service_entry = bind_service(fallback_);
         std::sort(prefix_.begin(), prefix_.end(), [](const RouteSnapshotEntry *a, const RouteSnapshotEntry *b) {
             return a->path.size() > b->path.size();
         });
@@ -131,11 +136,15 @@ public:
             *target = &entry->target;
             return true;
         }
-        std::unordered_map<std::string, ServiceRegistryEntry>::const_iterator it = services_.find(entry->service);
-        if (it == services_.end() || it->second.targets.empty()) {
+        const ServiceRegistryEntry *bound = entry->service_entry;
+        if (bound == nullptr || bound->targets.empty()) {
             return false;
         }
-        ServiceRegistryEntry &svc = const_cast<ServiceRegistryEntry &>(it->second);
+        ServiceRegistryEntry &svc = const_cast<ServiceRegistryEntry &>(*bound);
+        if (svc.targets.size() == 1) {
+            *target = &svc.targets[0];
+            return true;
+        }
         const std::size_t idx = svc.next_index++ % svc.targets.size();
         *target = &svc.targets[idx];
         return true;
@@ -148,6 +157,17 @@ public:
     RouteSnapshotEntry *mutable_fallback() { return has_fallback_ ? &fallback_ : nullptr; }
 
 private:
+    const ServiceRegistryEntry *bind_service(const RouteSnapshotEntry &entry) {
+        if (!entry.use_service || entry.service.empty()) {
+            return nullptr;
+        }
+        std::unordered_map<std::string, ServiceRegistryEntry>::iterator it = services_.find(entry.service);
+        if (it == services_.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
     static uint64_t HashPair(const char *method, std::size_t method_len,
                              const char *path, std::size_t path_len) {
         uint64_t h = 1469598103934665603ull;

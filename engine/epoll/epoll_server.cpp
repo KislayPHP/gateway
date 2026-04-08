@@ -64,7 +64,16 @@ static int online_cpu_count() {
 
 static int default_worker_processes() {
     const int cpus = online_cpu_count();
-    const int workers = cpus * 2;
+    if (cpus <= 2) {
+        return cpus > 0 ? cpus : 1;
+    }
+    int workers = cpus / 2;
+    if (workers < 2) {
+        workers = 2;
+    }
+    if (workers > 4) {
+        workers = 4;
+    }
     return workers > 0 ? workers : 1;
 }
 

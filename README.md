@@ -44,7 +44,9 @@ If `KISLAY_GATEWAY_ENGINE` is unset, Gateway falls back to the existing CivetWeb
 
 Worker count behavior on the native path:
 
-- if you do not set `KISLAY_GATEWAY_THREADS`, Gateway defaults to `CPU * 2`
+- if you do not set `KISLAY_GATEWAY_THREADS`, Gateway uses a conservative native auto worker count:
+  - `1-2` CPUs: same as CPU count
+  - larger machines: `CPU / 2`, capped at `4`
 - `setThreads(0)` also means “auto”
 - CivetWeb still requires an explicit positive thread count internally and falls back to `1`
 
@@ -164,7 +166,7 @@ Current native-path scope is intentionally narrower than the legacy path:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `KISLAY_GATEWAY_THREADS` | native: auto (`CPU * 2`), CivetWeb: `1` | Worker count. Unset uses native auto-scaling; `setThreads(0)` also selects auto for the native engine. |
+| `KISLAY_GATEWAY_THREADS` | native: auto (conservative, capped), CivetWeb: `1` | Worker count. Unset uses native auto-scaling; `setThreads(0)` also selects auto for the native engine. |
 | `KISLAY_GATEWAY_MAX_BODY` | `0` | Max request body bytes, `0` = unlimited |
 | `KISLAY_GATEWAY_AUTH_REQUIRED` | `0` | Enable edge auth checks |
 | `KISLAY_GATEWAY_AUTH_TOKEN` | empty | Expected bearer token in simple auth mode |

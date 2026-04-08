@@ -41,7 +41,9 @@ Platform support:
 
 Native worker selection:
 
-- if `KISLAY_GATEWAY_THREADS` is unset, the native engine defaults to `CPU * 2`
+- if `KISLAY_GATEWAY_THREADS` is unset, the native engine chooses a conservative worker count:
+  - `1-2` CPUs: same as CPU count
+  - larger machines: `CPU / 2`, capped at `4`
 - `setThreads(0)` also means native auto-scaling
 - the legacy CivetWeb path still normalizes invalid thread counts to `1`
 
