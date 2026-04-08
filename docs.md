@@ -30,7 +30,7 @@ The native path is the high-performance data plane. It keeps PHP out of the requ
 - per-worker process isolation with `SO_REUSEPORT`
 - non-blocking sockets
 - progress-based timeout enforcement
-- raw upstream header passthrough when safe
+- rebuilt client-facing response headers with explicit connection semantics
 - gated `splice()` zero-copy body forwarding when safe on Linux
 
 Platform support:
@@ -173,7 +173,7 @@ Client identity:
 - On ZTS builds, direct target routes can use request threads, but PHP resolvers are rejected.
 - Gateway remains synchronous in its proxy path by design; Core owns the async execution engine.
 - Configuration is startup-only. Runtime workers do not re-read PHP state after `listen()`.
-- Direct upstream targets reuse thread-local upstream connections when the upstream response is safely framed.
+- Native mode currently closes upstream connections after each response while the native-path reuse rules are being hardened.
 - Native mode currently supports direct target routes only.
 - Native mode does not yet support HTTP/2, HTTP/3, or fully optimized TLS upstream handling.
 

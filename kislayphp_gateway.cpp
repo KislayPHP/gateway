@@ -1126,8 +1126,12 @@ static bool kislayphp_gateway_listen_internal(php_kislayphp_gateway_t *gateway,
         return true;
     }
 
-    gateway->thread_count = kislayphp_sanitize_thread_count(
-        gateway->thread_count, "Kislay\\Gateway\\Gateway::listen");
+    if (gateway->thread_count == 0) {
+        gateway->thread_count = 1;
+    } else {
+        gateway->thread_count = kislayphp_sanitize_thread_count(
+            gateway->thread_count, "Kislay\\Gateway\\Gateway::listen");
+    }
     std::string listen_addr = std::string(host, host_len) + ":" + std::to_string(port);
     std::vector<const char *> options;
     options.push_back("listening_ports");

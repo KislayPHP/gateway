@@ -203,6 +203,7 @@ static int run_worker(EpollServerConfig config) {
     sa.sa_handler = handle_term_signal;
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
 
     const pid_t parent_pid = getppid();
 #ifdef __linux__

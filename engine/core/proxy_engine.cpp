@@ -108,6 +108,22 @@ static bool set_nonblocking(int fd, std::string *error_out) {
     return true;
 }
 
+static bool suppress_sigpipe(int fd, std::string *error_out) {
+#ifdef SO_NOSIGPIPE
+    int one = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) != 0) {
+        if (error_out != nullptr) {
+            *error_out = std::strerror(errno);
+        }
+        return false;
+    }
+#else
+    (void) fd;
+    (void) error_out;
+#endif
+    return true;
+}
+
 static bool set_tcp_nodelay(int fd) {
     int one = 1;
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
@@ -887,6 +903,11 @@ static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
         queue_error_response(conn, 502, "Upstream connect failed", true);
         return false;
     }
+    if (!suppress_sigpipe(fd, &err)) {
+        close_fd(fd);
+        queue_error_response(conn, 502, "Upstream connect failed", true);
+        return false;
+    }
     set_tcp_nodelay(fd);
     const int rc = connect(fd,
                            reinterpret_cast<const struct sockaddr *>(&conn->upstream_target->address),
@@ -1501,7 +1522,10 @@ static int accept_client_socket(int listen_fd) {
     int fd = accept(listen_fd, reinterpret_cast<sockaddr *>(&addr), &addr_len);
     if (fd >= 0) {
         std::string ignored;
-        set_nonblocking(fd, &ignored);
+        if (!set_nonblocking(fd, &ignored) || !suppress_sigpipe(fd, &ignored)) {
+            close_fd(fd);
+            return -1;
+        }
     }
     return fd;
 #endif

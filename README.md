@@ -137,7 +137,7 @@ Gateway keeps resilience lightweight:
 - read timeout on upstream responses
 - retry only for idempotent methods and only on pre-response upstream failures
 - simple per-upstream circuit breaker with `CLOSED / OPEN / HALF_OPEN`
-- thread-local upstream connection reuse for direct routes
+- native direct-route resolver snapshots and per-worker isolation
 
 ### Native data plane
 
@@ -146,7 +146,7 @@ With `KISLAY_GATEWAY_ENGINE=auto` or an explicit native loop, the native data pl
 - per-worker `SO_REUSEPORT` listener processes
 - non-blocking upstream proxying
 - progress-based timeout enforcement
-- raw upstream header passthrough on eligible responses
+- rebuilt client-facing response headers with explicit connection semantics
 - gated `splice()` body streaming for large, fixed-length responses on Linux
 - per-worker counters with no global locks
 
