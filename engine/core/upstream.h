@@ -19,6 +19,7 @@ struct UpstreamTarget {
     uint16_t port;
     bool use_tls;
     std::string base_path;
+    std::string request_header_suffix;
     sockaddr_storage address;
     socklen_t address_len;
     bool address_ready;

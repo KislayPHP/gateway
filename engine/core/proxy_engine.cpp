@@ -182,6 +182,23 @@ static void append_uint(FixedBuffer<32768> &buffer, uint64_t value) {
     append_literal(buffer, tmp);
 }
 
+static void populate_upstream_request_suffix(UpstreamTarget *target) {
+    if (target == nullptr) {
+        return;
+    }
+    target->request_header_suffix.clear();
+    target->request_header_suffix.reserve(target->host.size() + 48);
+    target->request_header_suffix.append(" HTTP/1.1\r\nHost: ");
+    target->request_header_suffix.append(target->host);
+    target->request_header_suffix.push_back(':');
+    char port_buf[16];
+    const int port_len = std::snprintf(port_buf, sizeof(port_buf), "%u", static_cast<unsigned>(target->port));
+    if (port_len > 0) {
+        target->request_header_suffix.append(port_buf, static_cast<std::size_t>(port_len));
+    }
+    target->request_header_suffix.append("\r\nConnection: keep-alive\r\n");
+}
+
 static bool is_hop_header(const char *buffer, const HeaderRef &header) {
     return HeaderEquals(buffer, header, "Connection") ||
            HeaderEquals(buffer, header, "Keep-Alive") ||
@@ -720,11 +737,9 @@ static bool build_upstream_request(Connection *conn, std::string *error_out) {
     append_bytes(conn->upstream_buffer, request_buffer + conn->request.method_off, conn->request.method_len);
     append_literal(conn->upstream_buffer, " ");
     append_target_path(conn->upstream_buffer, conn->upstream_target, conn->request, request_buffer);
-    append_literal(conn->upstream_buffer, " HTTP/1.1\r\nHost: ");
-    append_bytes(conn->upstream_buffer, conn->upstream_target->host.data(), conn->upstream_target->host.size());
-    append_literal(conn->upstream_buffer, ":");
-    append_uint(conn->upstream_buffer, conn->upstream_target->port);
-    append_literal(conn->upstream_buffer, "\r\nConnection: keep-alive\r\n");
+    append_bytes(conn->upstream_buffer,
+                 conn->upstream_target->request_header_suffix.data(),
+                 conn->upstream_target->request_header_suffix.size());
 
     for (uint16_t i = 0; i < conn->request.header_count; ++i) {
         const HeaderRef &header = conn->request_headers[i];
@@ -1584,6 +1599,7 @@ bool PrepareRouteSnapshot(RouteSnapshot *snapshot, std::string *error_out) {
     for (std::size_t i = 0; i < routes.size(); ++i) {
         if (!routes[i].use_service) {
             routes[i].target.host_hash = fnv1a32(routes[i].target.host.data(), routes[i].target.host.size());
+            populate_upstream_request_suffix(&routes[i].target);
             if (!build_sockaddr(routes[i].target.host.c_str(), routes[i].target.port, &routes[i].target.address,
                                 &routes[i].target.address_len, error_out)) {
                 return false;
@@ -1595,6 +1611,7 @@ bool PrepareRouteSnapshot(RouteSnapshot *snapshot, std::string *error_out) {
         RouteSnapshotEntry *fallback = snapshot->mutable_fallback();
         if (fallback != nullptr && !fallback->use_service) {
             fallback->target.host_hash = fnv1a32(fallback->target.host.data(), fallback->target.host.size());
+            populate_upstream_request_suffix(&fallback->target);
             if (!build_sockaddr(fallback->target.host.c_str(), fallback->target.port, &fallback->target.address,
                                 &fallback->target.address_len, error_out)) {
                 return false;
@@ -1607,6 +1624,7 @@ bool PrepareRouteSnapshot(RouteSnapshot *snapshot, std::string *error_out) {
         for (std::size_t target_idx = 0; target_idx < service.targets.size(); ++target_idx) {
             UpstreamTarget &target = service.targets[target_idx];
             target.host_hash = fnv1a32(target.host.data(), target.host.size());
+            populate_upstream_request_suffix(&target);
             if (!build_sockaddr(target.host.c_str(), target.port, &target.address, &target.address_len, error_out)) {
                 return false;
             }
