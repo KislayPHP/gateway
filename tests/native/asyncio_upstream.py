@@ -3,7 +3,7 @@ import argparse
 import asyncio
 
 
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, label_prefix: str) -> None:
     try:
         while True:
             try:
@@ -36,7 +36,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if path == "/slow":
                 await asyncio.sleep(0.05)
 
-            body = f"upstream-ok:{path}".encode("utf-8")
+            body = f"{label_prefix}:{path}".encode("utf-8")
             headers = [
                 b"HTTP/1.1 200 OK",
                 f"Content-Length: {len(body)}".encode("ascii"),
@@ -62,9 +62,11 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=19091)
+    parser.add_argument("--label-prefix", default="upstream-ok")
     args = parser.parse_args()
 
-    server = await asyncio.start_server(handle_client, args.host, args.port, reuse_address=True)
+    server = await asyncio.start_server(lambda r, w: handle_client(r, w, args.label_prefix),
+                                        args.host, args.port, reuse_address=True)
     async with server:
         await server.serve_forever()
 

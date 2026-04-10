@@ -1,4 +1,5 @@
 #include "proxy_engine.h"
+#include "timer_wheel.h"
 
 #include <algorithm>
 #include <cassert>
@@ -7,7 +8,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
-#include <poll.h>
 #include <signal.h>
 #include <string>
 #include <sys/resource.h>
@@ -74,6 +74,8 @@ static const uint64_t kClientWriteTimeoutMs = 30000ull;
 static const uint64_t kIdleKeepAliveTimeoutMs = 15000ull;
 static const uint64_t kUpstreamPoolIdleTimeoutMs = 15000ull;
 static const std::size_t kMaxIdleUpstreamsPerKey = 8u;
+static const std::size_t kTimerWheelSlots = 4096u;
+static const uint64_t kTimerWheelTickMs = 100ull;
 
 enum class TimeoutKind {
     None = 0,
@@ -159,7 +161,7 @@ static bool build_sockaddr(const char *host,
     return true;
 }
 
-static void append_literal(FixedBuffer<32768> &buffer, const char *text) {
+static void append_literal(FixedBuffer<kHeaderBufferBytes> &buffer, const char *text) {
     const std::size_t len = std::strlen(text);
     if (buffer.writable() < len) {
         return;
@@ -168,7 +170,7 @@ static void append_literal(FixedBuffer<32768> &buffer, const char *text) {
     buffer.produced(len);
 }
 
-static void append_bytes(FixedBuffer<32768> &buffer, const char *data, std::size_t len) {
+static void append_bytes(FixedBuffer<kHeaderBufferBytes> &buffer, const char *data, std::size_t len) {
     if (buffer.writable() < len) {
         return;
     }
@@ -176,7 +178,7 @@ static void append_bytes(FixedBuffer<32768> &buffer, const char *data, std::size
     buffer.produced(len);
 }
 
-static void append_uint(FixedBuffer<32768> &buffer, uint64_t value) {
+static void append_uint(FixedBuffer<kHeaderBufferBytes> &buffer, uint64_t value) {
     char tmp[32];
     std::snprintf(tmp, sizeof(tmp), "%llu", static_cast<unsigned long long>(value));
     append_literal(buffer, tmp);
@@ -231,6 +233,54 @@ static void mark_progress(Connection *conn, uint64_t now) {
     conn->keep_alive_idle = false;
 }
 
+static inline FixedBuffer<kHeaderBufferBytes> &client_buffer(Connection &conn) {
+    return conn.buffers->client_buffer;
+}
+
+static inline const FixedBuffer<kHeaderBufferBytes> &client_buffer(const Connection &conn) {
+    return conn.buffers->client_buffer;
+}
+
+static inline FixedBuffer<kHeaderBufferBytes> &upstream_buffer(Connection &conn) {
+    return conn.buffers->upstream_buffer;
+}
+
+static inline const FixedBuffer<kHeaderBufferBytes> &upstream_buffer(const Connection &conn) {
+    return conn.buffers->upstream_buffer;
+}
+
+static inline RequestHead &request_head(Connection &conn) {
+    return conn.buffers->request;
+}
+
+static inline const RequestHead &request_head(const Connection &conn) {
+    return conn.buffers->request;
+}
+
+static inline ResponseHead &response_head(Connection &conn) {
+    return conn.buffers->response;
+}
+
+static inline const ResponseHead &response_head(const Connection &conn) {
+    return conn.buffers->response;
+}
+
+static inline HeaderRef *request_headers(Connection &conn) {
+    return conn.buffers->request_headers;
+}
+
+static inline const HeaderRef *request_headers(const Connection &conn) {
+    return conn.buffers->request_headers;
+}
+
+static inline HeaderRef *response_headers(Connection &conn) {
+    return conn.buffers->response_headers;
+}
+
+static inline const HeaderRef *response_headers(const Connection &conn) {
+    return conn.buffers->response_headers;
+}
+
 } // namespace
 
 struct WorkerRuntime {
@@ -264,10 +314,16 @@ struct WorkerRuntime {
     int listener_fd;
     int worker_index;
     std::vector<Connection> connections;
+    std::vector<ConnectionBuffers> connection_buffers;
     std::vector<uint32_t> free_list;
     RouteSnapshot snapshot;
+    std::shared_ptr<ServiceSnapshot> services;
+    DiscoveryManager discovery;
     std::size_t max_body_bytes;
+    TimerWheel timers;
+    std::vector<uint32_t> expired_connections;
     std::unordered_map<PoolKey, std::deque<PooledUpstream>, PoolKeyHash> upstream_pool;
+    uint64_t last_upstream_pool_reap_ms;
     uint64_t total_requests;
     uint64_t active_connections;
     uint64_t peak_active_connections;
@@ -283,6 +339,7 @@ struct WorkerRuntime {
         : listener_fd(-1),
           worker_index(0),
           max_body_bytes(0),
+          last_upstream_pool_reap_ms(0),
           total_requests(0),
           active_connections(0),
           peak_active_connections(0),
@@ -303,7 +360,7 @@ static uint64_t timeout_for_connection(const Connection *conn, TimeoutKind *kind
 
     switch (conn->state) {
         case ConnState::ReadClientHeaders:
-            if (conn->client_buffer.empty() && conn->keep_alive_idle) {
+            if (client_buffer(*conn).empty() && conn->keep_alive_idle) {
                 kind = TimeoutKind::IdleKeepAlive;
                 timeout_ms = kIdleKeepAliveTimeoutMs;
             } else {
@@ -376,12 +433,12 @@ static uint32_t desired_client_events(const Connection *conn) {
             events |= platform::kEventRead;
             break;
         case ConnState::WriteUpstream:
-            if (conn->request_body_forwarded < conn->request_body_expected && conn->client_buffer.writable() > 0) {
+            if (conn->request_body_forwarded < conn->request_body_expected && client_buffer(*conn).writable() > 0) {
                 events |= platform::kEventRead;
             }
             break;
         case ConnState::WriteClient:
-            if (!conn->client_buffer.empty() || !conn->upstream_buffer.empty()) {
+            if (!client_buffer(*conn).empty() || !upstream_buffer(*conn).empty()) {
                 events |= platform::kEventWrite;
             }
             break;
@@ -404,7 +461,7 @@ static uint32_t desired_upstream_events(const Connection *conn) {
             events |= platform::kEventWrite;
             break;
         case ConnState::ReadUpstream:
-            if (conn->upstream_buffer.writable() > 0) {
+            if (upstream_buffer(*conn).writable() > 0) {
                 events |= platform::kEventRead;
             }
             break;
@@ -441,6 +498,7 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn);
 static bool handle_splice_response_body(WorkerRuntime *rt, Connection *conn);
 static bool handle_client_write(WorkerRuntime *rt, Connection *conn);
 static bool handle_connection_timeout(WorkerRuntime *rt, Connection *conn, TimeoutKind kind, uint64_t now);
+static void refresh_connection_timeout(WorkerRuntime *rt, Connection *conn, uint64_t now);
 
 static bool arm_error_response(WorkerRuntime *rt, Connection *conn) {
     ++rt->total_errors;
@@ -453,6 +511,8 @@ static void release_connection(WorkerRuntime *rt, Connection *conn) {
     if (!conn->in_use && conn->client_fd < 0 && conn->upstream_fd < 0) {
         return;
     }
+    TimerWheel &timers = rt->timers;
+    timers.Disarm(&rt->connections, connection_index(rt, conn));
     if (conn->pipefd[0] >= 0) {
         close_fd(conn->pipefd[0]);
     }
@@ -528,6 +588,19 @@ static void close_upstream_side(WorkerRuntime *rt, Connection *conn) {
         close_fd(conn->upstream_fd);
         conn->upstream_events = 0;
     }
+}
+
+static void refresh_connection_timeout(WorkerRuntime *rt, Connection *conn, uint64_t now) {
+    if (rt == nullptr || conn == nullptr || !conn->in_use || conn->client_fd < 0) {
+        return;
+    }
+    TimeoutKind kind = TimeoutKind::None;
+    const uint64_t timeout_ms = timeout_for_connection(conn, &kind);
+    if (timeout_ms == 0 || kind == TimeoutKind::None) {
+        rt->timers.Disarm(&rt->connections, connection_index(rt, conn));
+        return;
+    }
+    rt->timers.Arm(&rt->connections, connection_index(rt, conn), now + timeout_ms);
 }
 
 static WorkerRuntime::PoolKey pool_key_for(const UpstreamTarget *target) {
@@ -655,7 +728,7 @@ static void reap_stale_upstream_pool(WorkerRuntime *rt, uint64_t now) {
 }
 
 static void queue_error_response(Connection *conn, int status, const char *message, bool close_after) {
-    conn->client_buffer.clear();
+    client_buffer(*conn).clear();
     conn->safe_upstream_keep_alive = false;
     conn->splice_enabled = false;
     conn->splice_eof = false;
@@ -688,17 +761,17 @@ static void queue_error_response(Connection *conn, int status, const char *messa
                                   std::strlen(message),
                                   close_after ? "close" : "keep-alive",
                                   message);
-    append_bytes(conn->client_buffer, header, static_cast<std::size_t>(len));
+    append_bytes(client_buffer(*conn), header, static_cast<std::size_t>(len));
     conn->state = ConnState::WriteClient;
     conn->close_after_response = close_after;
     conn->safe_client_keep_alive = !close_after;
     conn->response_parsed = true;
-    conn->response.no_body = true;
+    response_head(*conn).no_body = true;
     conn->response_body_expected = 0;
     conn->response_body_forwarded = 0;
 }
 
-static void append_target_path(FixedBuffer<32768> &buffer,
+static void append_target_path(FixedBuffer<kHeaderBufferBytes> &buffer,
                                const UpstreamTarget *target,
                                const RequestHead &request,
                                const char *request_buffer) {
@@ -731,60 +804,60 @@ static void append_target_path(FixedBuffer<32768> &buffer,
 }
 
 static bool build_upstream_request(Connection *conn, std::string *error_out) {
-    conn->upstream_buffer.clear();
-    const char *request_buffer = conn->client_buffer.data();
+    upstream_buffer(*conn).clear();
+    const char *request_buffer = client_buffer(*conn).data();
 
-    append_bytes(conn->upstream_buffer, request_buffer + conn->request.method_off, conn->request.method_len);
-    append_literal(conn->upstream_buffer, " ");
-    append_target_path(conn->upstream_buffer, conn->upstream_target, conn->request, request_buffer);
-    append_bytes(conn->upstream_buffer,
+    append_bytes(upstream_buffer(*conn), request_buffer + request_head(*conn).method_off, request_head(*conn).method_len);
+    append_literal(upstream_buffer(*conn), " ");
+    append_target_path(upstream_buffer(*conn), conn->upstream_target, request_head(*conn), request_buffer);
+    append_bytes(upstream_buffer(*conn),
                  conn->upstream_target->request_header_suffix.data(),
                  conn->upstream_target->request_header_suffix.size());
 
-    for (uint16_t i = 0; i < conn->request.header_count; ++i) {
-        const HeaderRef &header = conn->request_headers[i];
+    for (uint16_t i = 0; i < request_head(*conn).header_count; ++i) {
+        const HeaderRef &header = request_headers(*conn)[i];
         if (HeaderEquals(request_buffer, header, "Host") || is_hop_header(request_buffer, header)) {
             continue;
         }
-        append_bytes(conn->upstream_buffer, request_buffer + header.name_off, header.name_len);
-        append_literal(conn->upstream_buffer, ": ");
-        append_bytes(conn->upstream_buffer, request_buffer + header.value_off, header.value_len);
-        append_literal(conn->upstream_buffer, "\r\n");
+        append_bytes(upstream_buffer(*conn), request_buffer + header.name_off, header.name_len);
+        append_literal(upstream_buffer(*conn), ": ");
+        append_bytes(upstream_buffer(*conn), request_buffer + header.value_off, header.value_len);
+        append_literal(upstream_buffer(*conn), "\r\n");
     }
 
-    if (!conn->request.has_content_length && conn->request_body_expected > 0) {
-        append_literal(conn->upstream_buffer, "Content-Length: ");
-        append_uint(conn->upstream_buffer, conn->request_body_expected);
-        append_literal(conn->upstream_buffer, "\r\n");
+    if (!request_head(*conn).has_content_length && conn->request_body_expected > 0) {
+        append_literal(upstream_buffer(*conn), "Content-Length: ");
+        append_uint(upstream_buffer(*conn), conn->request_body_expected);
+        append_literal(upstream_buffer(*conn), "\r\n");
     }
-    append_literal(conn->upstream_buffer, "\r\n");
+    append_literal(upstream_buffer(*conn), "\r\n");
 
-    const std::size_t body_offset = conn->request.headers_end;
-    const std::size_t body_available = conn->client_buffer.end > body_offset ? (conn->client_buffer.end - body_offset) : 0;
+    const std::size_t body_offset = request_head(*conn).headers_end;
+    const std::size_t body_available = client_buffer(*conn).end > body_offset ? (client_buffer(*conn).end - body_offset) : 0;
     std::size_t to_copy = body_available;
-    if (to_copy > conn->upstream_buffer.writable()) {
-        to_copy = conn->upstream_buffer.writable();
+    if (to_copy > upstream_buffer(*conn).writable()) {
+        to_copy = upstream_buffer(*conn).writable();
     }
     if (to_copy > conn->request_body_expected) {
         to_copy = static_cast<std::size_t>(conn->request_body_expected);
     }
     if (to_copy > 0) {
-        append_bytes(conn->upstream_buffer, conn->client_buffer.data() + body_offset, to_copy);
+        append_bytes(upstream_buffer(*conn), client_buffer(*conn).data() + body_offset, to_copy);
     }
     conn->request_body_forwarded = to_copy;
 
     if (body_available > to_copy) {
         const std::size_t remain = body_available - to_copy;
         if (remain > 0) {
-            std::memmove(conn->client_buffer.data(), request_buffer + body_offset + to_copy, remain);
-            conn->client_buffer.end = remain;
+            std::memmove(client_buffer(*conn).data(), request_buffer + body_offset + to_copy, remain);
+            client_buffer(*conn).end = remain;
         }
     } else {
-        conn->client_buffer.clear();
+        client_buffer(*conn).clear();
     }
-    conn->pipelined_bytes = conn->client_buffer.end > (conn->request_body_expected - conn->request_body_forwarded);
+    conn->pipelined_bytes = client_buffer(*conn).end > (conn->request_body_expected - conn->request_body_forwarded);
 
-    if (conn->upstream_buffer.empty()) {
+    if (upstream_buffer(*conn).empty()) {
         if (error_out != nullptr) {
             *error_out = "failed to build upstream request";
         }
@@ -794,16 +867,16 @@ static bool build_upstream_request(Connection *conn, std::string *error_out) {
 }
 
 static bool route_request(WorkerRuntime *rt, Connection *conn) {
-    const RouteSnapshotEntry *route = rt->snapshot.Match(conn->client_buffer.data() + conn->request.method_off,
-                                                         conn->request.method_len,
-                                                         conn->client_buffer.data() + conn->request.path_off,
-                                                         conn->request.path_len);
+    const RouteSnapshotEntry *route = rt->snapshot.Match(client_buffer(*conn).data() + request_head(*conn).method_off,
+                                                         request_head(*conn).method_len,
+                                                         client_buffer(*conn).data() + request_head(*conn).path_off,
+                                                         request_head(*conn).path_len);
     if (route == nullptr) {
         queue_error_response(conn, 404, "Not Found", true);
         return false;
     }
     conn->route = route;
-    if (!rt->snapshot.Resolve(route, &conn->upstream_target) || conn->upstream_target == nullptr) {
+    if (!rt->snapshot.Resolve(route, rt->services.get(), &conn->upstream_target) || conn->upstream_target == nullptr) {
         queue_error_response(conn, 502, "Service not available", true);
         return false;
     }
@@ -815,8 +888,8 @@ static bool route_request(WorkerRuntime *rt, Connection *conn) {
 }
 
 static bool flush_iov(int fd,
-                      FixedBuffer<32768> *first,
-                      FixedBuffer<32768> *second,
+                      FixedBuffer<kHeaderBufferBytes> *first,
+                      FixedBuffer<kHeaderBufferBytes> *second,
                       bool *blocked,
                       std::size_t *bytes_written_out) {
     struct iovec iov[2];
@@ -869,7 +942,7 @@ static bool flush_iov(int fd,
     }
 }
 
-static bool read_into_buffer(int fd, FixedBuffer<32768> *buffer, bool *saw_eof, std::size_t *bytes_read_out) {
+static bool read_into_buffer(int fd, FixedBuffer<kHeaderBufferBytes> *buffer, bool *saw_eof, std::size_t *bytes_read_out) {
     std::size_t total_read = 0;
     for (;;) {
         buffer->compact_if_needed();
@@ -973,19 +1046,19 @@ static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
 
 static bool handle_client_header_read(WorkerRuntime *rt, Connection *conn) {
     std::size_t bytes_read = 0;
-    if (!read_into_buffer(conn->client_fd, &conn->client_buffer, &conn->saw_client_eof, &bytes_read)) {
+    if (!read_into_buffer(conn->client_fd, &client_buffer(*conn), &conn->saw_client_eof, &bytes_read)) {
         return false;
     }
     if (bytes_read > 0) {
         mark_progress(conn, now_ms());
     }
-    if (unlikely(conn->saw_client_eof && conn->client_buffer.empty())) {
+    if (unlikely(conn->saw_client_eof && client_buffer(*conn).empty())) {
         return false;
     }
 
     const char *error = nullptr;
-    const ParseStatus status = ParseRequestHead(conn->client_buffer.data(), conn->client_buffer.end,
-                                                &conn->request, conn->request_headers, 64, &error);
+    const ParseStatus status = ParseRequestHead(client_buffer(*conn).data(), client_buffer(*conn).end,
+                                                &request_head(*conn), request_headers(*conn), kMaxHeaderRefs, &error);
     if (status == ParseStatus::NeedMore) {
         if (conn->saw_client_eof) {
             return false;
@@ -1000,20 +1073,20 @@ static bool handle_client_header_read(WorkerRuntime *rt, Connection *conn) {
         return arm_error_response(rt, conn);
     }
 
-    if (conn->request.chunked) {
+    if (request_head(*conn).chunked) {
         queue_error_response(conn, 501, "chunked request bodies are not supported", true);
         return arm_error_response(rt, conn);
     }
-    if (rt->max_body_bytes > 0 && conn->request.content_length > rt->max_body_bytes) {
+    if (rt->max_body_bytes > 0 && request_head(*conn).content_length > rt->max_body_bytes) {
         queue_error_response(conn, 413, "payload too large", true);
         return arm_error_response(rt, conn);
     }
 
     conn->request_parsed = true;
     ++rt->total_requests;
-    conn->client_keep_alive = conn->request.keep_alive;
-    conn->request_body_expected = conn->request.has_content_length ? conn->request.content_length : 0;
-    conn->request.no_body = conn->request_body_expected == 0;
+    conn->client_keep_alive = request_head(*conn).keep_alive;
+    conn->request_body_expected = request_head(*conn).has_content_length ? request_head(*conn).content_length : 0;
+    request_head(*conn).no_body = conn->request_body_expected == 0;
 
     if (!route_request(rt, conn)) {
         return arm_error_response(rt, conn);
@@ -1045,13 +1118,13 @@ static bool handle_upstream_connect(WorkerRuntime *rt, Connection *conn) {
 static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
     for (;;) {
         bool blocked = false;
-        const std::size_t request_body_before = conn->client_buffer.readable();
+        const std::size_t request_body_before = client_buffer(*conn).readable();
         std::size_t bytes_written = 0;
-        if (!flush_iov(conn->upstream_fd, &conn->upstream_buffer, &conn->client_buffer, &blocked, &bytes_written)) {
+        if (!flush_iov(conn->upstream_fd, &upstream_buffer(*conn), &client_buffer(*conn), &blocked, &bytes_written)) {
             queue_error_response(conn, 502, "upstream write failed", true);
             return arm_error_response(rt, conn);
         }
-        const std::size_t request_body_after = conn->client_buffer.readable();
+        const std::size_t request_body_after = client_buffer(*conn).readable();
         const std::size_t body_forwarded_now =
             request_body_before >= request_body_after ? (request_body_before - request_body_after) : 0;
         if (request_body_before >= request_body_after) {
@@ -1069,16 +1142,16 @@ static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
         }
 
         bool body_read_progress = false;
-        while (conn->request_body_forwarded < conn->request_body_expected && conn->client_buffer.empty()) {
+        while (conn->request_body_forwarded < conn->request_body_expected && client_buffer(*conn).empty()) {
             const uint64_t remain = conn->request_body_expected - conn->request_body_forwarded;
-            conn->client_buffer.compact_if_needed();
-            const std::size_t want = static_cast<std::size_t>(std::min<uint64_t>(conn->client_buffer.writable(), remain));
+            client_buffer(*conn).compact_if_needed();
+            const std::size_t want = static_cast<std::size_t>(std::min<uint64_t>(client_buffer(*conn).writable(), remain));
             if (want == 0) {
                 break;
             }
-            const ssize_t n = recv(conn->client_fd, conn->client_buffer.write_ptr(), want, 0);
+            const ssize_t n = recv(conn->client_fd, client_buffer(*conn).write_ptr(), want, 0);
             if (n > 0) {
-                conn->client_buffer.produced(static_cast<std::size_t>(n));
+                client_buffer(*conn).produced(static_cast<std::size_t>(n));
                 body_read_progress = true;
                 continue;
             }
@@ -1099,7 +1172,7 @@ static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
             }
         }
 
-        if (conn->upstream_buffer.empty() && conn->client_buffer.empty() &&
+        if (upstream_buffer(*conn).empty() && client_buffer(*conn).empty() &&
             conn->request_body_forwarded >= conn->request_body_expected) {
             conn->state = ConnState::ReadUpstream;
         }
@@ -1114,29 +1187,29 @@ static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
 }
 
 static bool build_client_response_header(Connection *conn) {
-    conn->client_buffer.clear();
-    const char *resp = conn->upstream_buffer.data();
+    client_buffer(*conn).clear();
+    const char *resp = upstream_buffer(*conn).data();
     char status_line[512];
     int line_len = std::snprintf(status_line, sizeof(status_line), "HTTP/1.1 %u %.*s\r\n",
-                                 static_cast<unsigned>(conn->response.status_code),
-                                 static_cast<int>(conn->response.reason_len),
-                                 resp + conn->response.reason_off);
-    append_bytes(conn->client_buffer, status_line, static_cast<std::size_t>(line_len));
+                                 static_cast<unsigned>(response_head(*conn).status_code),
+                                 static_cast<int>(response_head(*conn).reason_len),
+                                 resp + response_head(*conn).reason_off);
+    append_bytes(client_buffer(*conn), status_line, static_cast<std::size_t>(line_len));
 
-    for (uint16_t i = 0; i < conn->response.header_count; ++i) {
-        const HeaderRef &header = conn->response_headers[i];
+    for (uint16_t i = 0; i < response_head(*conn).header_count; ++i) {
+        const HeaderRef &header = response_headers(*conn)[i];
         if (HeaderEquals(resp, header, "Connection")) {
             continue;
         }
-        append_bytes(conn->client_buffer, resp + header.name_off, header.name_len);
-        append_literal(conn->client_buffer, ": ");
-        append_bytes(conn->client_buffer, resp + header.value_off, header.value_len);
-        append_literal(conn->client_buffer, "\r\n");
+        append_bytes(client_buffer(*conn), resp + header.name_off, header.name_len);
+        append_literal(client_buffer(*conn), ": ");
+        append_bytes(client_buffer(*conn), resp + header.value_off, header.value_len);
+        append_literal(client_buffer(*conn), "\r\n");
     }
-    if (!conn->response.has_content_length && conn->response.no_body) {
-        append_literal(conn->client_buffer, "Content-Length: 0\r\n");
+    if (!response_head(*conn).has_content_length && response_head(*conn).no_body) {
+        append_literal(client_buffer(*conn), "Content-Length: 0\r\n");
     }
-    append_literal(conn->client_buffer,
+    append_literal(client_buffer(*conn),
                    conn->safe_client_keep_alive ? "Connection: keep-alive\r\n\r\n"
                                                 : "Connection: close\r\n\r\n");
     return true;
@@ -1188,20 +1261,20 @@ static bool can_splice_response_body(WorkerRuntime *rt, const Connection *conn) 
     if (!rt->loop->SupportsSplice()) {
         return false;
     }
-    if (conn->response.version_len != 8) {
+    if (response_head(*conn).version_len != 8) {
         return false;
     }
-    const char *response_buffer = conn->upstream_buffer.data();
-    if (std::memcmp(response_buffer + conn->response.version_off, "HTTP/1.1", 8) != 0) {
+    const char *response_buffer = upstream_buffer(*conn).data();
+    if (std::memcmp(response_buffer + response_head(*conn).version_off, "HTTP/1.1", 8) != 0) {
         return false;
     }
-    if (!conn->response.has_content_length || conn->response.no_body) {
+    if (!response_head(*conn).has_content_length || response_head(*conn).no_body) {
         return false;
     }
-    if (conn->response.chunked || conn->response.close_delimited) {
+    if (response_head(*conn).chunked || response_head(*conn).close_delimited) {
         return false;
     }
-    if (conn->response.content_length < 8192) {
+    if (response_head(*conn).content_length < 8192) {
         return false;
     }
     return true;
@@ -1209,7 +1282,7 @@ static bool can_splice_response_body(WorkerRuntime *rt, const Connection *conn) 
 
 static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
     std::size_t bytes_read = 0;
-    if (!read_into_buffer(conn->upstream_fd, &conn->upstream_buffer, &conn->saw_upstream_eof, &bytes_read)) {
+    if (!read_into_buffer(conn->upstream_fd, &upstream_buffer(*conn), &conn->saw_upstream_eof, &bytes_read)) {
         queue_error_response(conn, 502, "upstream read failed", true);
         return arm_error_response(rt, conn);
     }
@@ -1218,8 +1291,8 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
     }
     if (!conn->response_parsed) {
         const char *error = nullptr;
-        const ParseStatus status = ParseResponseHead(conn->upstream_buffer.data(), conn->upstream_buffer.end,
-                                                     &conn->response, conn->response_headers, 64, &error);
+        const ParseStatus status = ParseResponseHead(upstream_buffer(*conn).data(), upstream_buffer(*conn).end,
+                                                     &response_head(*conn), response_headers(*conn), kMaxHeaderRefs, &error);
         if (status == ParseStatus::NeedMore) {
             if (conn->saw_upstream_eof) {
                 queue_error_response(conn, 502, "upstream closed before response headers completed", true);
@@ -1232,18 +1305,18 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
             return arm_error_response(rt, conn);
         }
         conn->response_parsed = true;
-        conn->response_body_expected = conn->response.has_content_length ? conn->response.content_length : 0;
+        conn->response_body_expected = response_head(*conn).has_content_length ? response_head(*conn).content_length : 0;
         conn->safe_upstream_keep_alive =
-            conn->response.keep_alive &&
-            (conn->response.has_content_length || conn->response.no_body) &&
-            !conn->response.chunked &&
-            !conn->response.close_delimited;
+            response_head(*conn).keep_alive &&
+            (response_head(*conn).has_content_length || response_head(*conn).no_body) &&
+            !response_head(*conn).chunked &&
+            !response_head(*conn).close_delimited;
         conn->safe_client_keep_alive =
             conn->client_keep_alive &&
             !conn->pipelined_bytes &&
-            (conn->response.has_content_length || conn->response.no_body) &&
-            !conn->response.chunked &&
-            !conn->response.close_delimited;
+            (response_head(*conn).has_content_length || response_head(*conn).no_body) &&
+            !response_head(*conn).chunked &&
+            !response_head(*conn).close_delimited;
         conn->close_after_response = !conn->safe_client_keep_alive;
         conn->splice_enabled = can_splice_response_body(rt, conn);
         conn->remaining_bytes = conn->response_body_expected;
@@ -1256,15 +1329,15 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
         if (conn->splice_enabled) {
             ++rt->splice_hits;
         }
-        conn->response_header_bytes = conn->response.headers_end;
+        conn->response_header_bytes = response_head(*conn).headers_end;
         conn->response_header_forwarded = 0;
         if (conn->passthrough_response_headers) {
-            conn->client_buffer.clear();
+            client_buffer(*conn).clear();
         } else {
             build_client_response_header(conn);
-            conn->upstream_buffer.start = conn->response.headers_end;
-            if (conn->upstream_buffer.start > conn->upstream_buffer.end) {
-                conn->upstream_buffer.start = conn->upstream_buffer.end;
+            upstream_buffer(*conn).start = response_head(*conn).headers_end;
+            if (upstream_buffer(*conn).start > upstream_buffer(*conn).end) {
+                upstream_buffer(*conn).start = upstream_buffer(*conn).end;
             }
         }
         conn->state = ConnState::WriteClient;
@@ -1274,7 +1347,7 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
         return handle_client_write(rt, conn);
     }
 
-    if (!conn->upstream_buffer.empty()) {
+    if (!upstream_buffer(*conn).empty()) {
         conn->state = ConnState::WriteClient;
         if (!refresh_client_interest(rt, conn) || !refresh_upstream_interest(rt, conn)) {
             return false;
@@ -1283,12 +1356,12 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
     }
     if (conn->saw_upstream_eof) {
         conn->safe_upstream_keep_alive = false;
-        const uint64_t buffered_body = static_cast<uint64_t>(conn->upstream_buffer.readable());
+        const uint64_t buffered_body = static_cast<uint64_t>(upstream_buffer(*conn).readable());
         const uint64_t completed_body = conn->response_body_forwarded + buffered_body;
         const bool body_complete =
-            conn->response.no_body ||
-            conn->response.close_delimited ||
-            (conn->response.has_content_length && completed_body >= conn->response_body_expected);
+            response_head(*conn).no_body ||
+            response_head(*conn).close_delimited ||
+            (response_head(*conn).has_content_length && completed_body >= conn->response_body_expected);
         if (!body_complete) {
             if (!response_started_to_client(conn)) {
                 queue_error_response(conn, 502, "upstream closed before response body completed", true);
@@ -1297,7 +1370,7 @@ static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn) {
             return false;
         }
         close_upstream_side(rt, conn);
-        if (conn->client_buffer.empty() && conn->upstream_buffer.empty()) {
+        if (client_buffer(*conn).empty() && upstream_buffer(*conn).empty()) {
             return conn->safe_client_keep_alive ? finish_response(rt, conn) : (release_connection(rt, conn), true);
         }
         conn->state = ConnState::WriteClient;
@@ -1422,16 +1495,16 @@ static bool finish_response(WorkerRuntime *rt, Connection *conn) {
 
 static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
     bool blocked = false;
-    const std::size_t body_before = conn->upstream_buffer.readable();
+    const std::size_t body_before = upstream_buffer(*conn).readable();
     std::size_t bytes_written = 0;
-    if (!flush_iov(conn->client_fd, &conn->client_buffer, &conn->upstream_buffer, &blocked, &bytes_written)) {
+    if (!flush_iov(conn->client_fd, &client_buffer(*conn), &upstream_buffer(*conn), &blocked, &bytes_written)) {
         return false;
     }
     if (bytes_written > 0) {
         conn->response_started = true;
         mark_progress(conn, now_ms());
     }
-    const std::size_t body_after = conn->upstream_buffer.readable();
+    const std::size_t body_after = upstream_buffer(*conn).readable();
     if (body_before >= body_after) {
         std::size_t upstream_forwarded = body_before - body_after;
         if (conn->passthrough_response_headers && upstream_forwarded > 0) {
@@ -1447,18 +1520,18 @@ static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
         }
     }
 
-    if (conn->response_parsed && conn->response.no_body && conn->client_buffer.empty() && conn->upstream_buffer.empty()) {
+    if (conn->response_parsed && response_head(*conn).no_body && client_buffer(*conn).empty() && upstream_buffer(*conn).empty()) {
         return finish_response(rt, conn);
     }
-    if (conn->response_parsed && conn->response.has_content_length && conn->client_buffer.empty() && conn->upstream_buffer.empty() && conn->response_body_forwarded >= conn->response_body_expected) {
+    if (conn->response_parsed && response_head(*conn).has_content_length && client_buffer(*conn).empty() && upstream_buffer(*conn).empty() && conn->response_body_forwarded >= conn->response_body_expected) {
         return finish_response(rt, conn);
     }
-    if ((conn->response.chunked || conn->response.close_delimited) && conn->saw_upstream_eof && conn->client_buffer.empty() && conn->upstream_buffer.empty()) {
+    if ((response_head(*conn).chunked || response_head(*conn).close_delimited) && conn->saw_upstream_eof && client_buffer(*conn).empty() && upstream_buffer(*conn).empty()) {
         release_connection(rt, conn);
         return true;
     }
 
-    if (conn->client_buffer.empty() && conn->upstream_buffer.empty() && conn->response_parsed) {
+    if (client_buffer(*conn).empty() && upstream_buffer(*conn).empty() && conn->response_parsed) {
         conn->state = (conn->splice_enabled && conn->remaining_bytes > 0)
                           ? ConnState::SpliceResponseBody
                           : ConnState::ReadUpstream;
@@ -1510,13 +1583,23 @@ static bool handle_connection_timeout(WorkerRuntime *rt, Connection *conn, Timeo
 }
 
 static void reap_idle(WorkerRuntime *rt, uint64_t now) {
-    reap_stale_upstream_pool(rt, now);
-    for (std::size_t i = 0; i < rt->connections.size(); ++i) {
-        Connection &conn = rt->connections[i];
-        if (conn.client_fd < 0) {
+    if (rt->last_upstream_pool_reap_ms == 0 || (now - rt->last_upstream_pool_reap_ms) >= 1000ull) {
+        reap_stale_upstream_pool(rt, now);
+        rt->last_upstream_pool_reap_ms = now;
+    }
+    rt->expired_connections.clear();
+    rt->timers.CollectExpired(&rt->connections, now, &rt->expired_connections);
+    for (std::size_t i = 0; i < rt->expired_connections.size(); ++i) {
+        const uint32_t index = rt->expired_connections[i];
+        if (index >= rt->connections.size()) {
             continue;
         }
-        if (now <= conn.last_progress_ms) {
+        Connection &conn = rt->connections[index];
+        if (!conn.in_use || conn.client_fd < 0) {
+            continue;
+        }
+        if (now < conn.deadline_ms) {
+            refresh_connection_timeout(rt, &conn, now);
             continue;
         }
         TimeoutKind kind = TimeoutKind::None;
@@ -1540,10 +1623,8 @@ static void reap_idle(WorkerRuntime *rt, uint64_t now) {
                              conn.upstream_fd);
             }
         }
-        if ((now - conn.last_progress_ms) > timeout_ms) {
-            if (!handle_connection_timeout(rt, &conn, kind, now)) {
-                release_connection(rt, &conn);
-            }
+        if (!handle_connection_timeout(rt, &conn, kind, now)) {
+            release_connection(rt, &conn);
         }
     }
 }
@@ -1619,8 +1700,9 @@ bool PrepareRouteSnapshot(RouteSnapshot *snapshot, std::string *error_out) {
             fallback->target.address_ready = true;
         }
     }
-    for (RouteSnapshot::service_iterator it = snapshot->services_begin(); it != snapshot->services_end(); ++it) {
-        ServiceRegistryEntry &service = it->second;
+    std::vector<ServiceDefinition> &services = snapshot->mutable_service_definitions();
+    for (std::size_t service_idx = 0; service_idx < services.size(); ++service_idx) {
+        ServiceDefinition &service = services[service_idx];
         for (std::size_t target_idx = 0; target_idx < service.targets.size(); ++target_idx) {
             UpstreamTarget &target = service.targets[target_idx];
             target.host_hash = fnv1a32(target.host.data(), target.host.size());
@@ -1646,10 +1728,18 @@ bool ProxyEngine::Initialize(std::string *error_out) {
     runtime_->listener_fd = config_.listener_fd;
     runtime_->worker_index = config_.worker_index;
     runtime_->snapshot = config_.snapshot;
+    if (!runtime_->discovery.Initialize(runtime_->snapshot, config_.discovery, error_out)) {
+        return false;
+    }
+    runtime_->services = runtime_->discovery.Current();
     runtime_->max_body_bytes = config_.max_body_bytes;
     runtime_->connections.resize(config_.max_connections > 0 ? config_.max_connections : 16384);
+    runtime_->connection_buffers.resize(runtime_->connections.size());
+    runtime_->timers.Initialize(kTimerWheelSlots, kTimerWheelTickMs);
+    runtime_->expired_connections.reserve(runtime_->connections.size());
     runtime_->free_list.reserve(runtime_->connections.size());
     for (uint32_t i = 0; i < runtime_->connections.size(); ++i) {
+        runtime_->connections[i].buffers = &runtime_->connection_buffers[i];
         runtime_->free_list.push_back(static_cast<uint32_t>(runtime_->connections.size() - 1 - i));
     }
     if (runtime_->listener_fd >= 0) {
@@ -1697,8 +1787,12 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
         }
 
         std::string loop_error;
-        const int n = runtime_->loop->Wait(events, 256, (stop_flag != nullptr && *stop_flag) ? 100 : 1000, &loop_error);
+        const int wait_timeout_ms =
+            (stop_flag != nullptr && *stop_flag) ? 100 : runtime_->discovery.WaitTimeoutMs();
+        const int n = runtime_->loop->Wait(events, 256, wait_timeout_ms, &loop_error);
         const uint64_t now = now_ms();
+        runtime_->discovery.MaybeRefresh(now);
+        runtime_->services = runtime_->discovery.Current();
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -1751,6 +1845,9 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
                         release_connection(runtime_.get(), &conn);
                         continue;
                     }
+                    if (conn.in_use && conn.client_fd >= 0) {
+                        refresh_connection_timeout(runtime_.get(), &conn, now);
+                    }
                 }
                 continue;
             }
@@ -1789,7 +1886,7 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
                             release_connection(runtime_.get(), conn);
                             continue;
                         }
-                        if (!platform::HasEvent(event_mask, platform::kEventRead) && conn->client_buffer.empty()) {
+                        if (!platform::HasEvent(event_mask, platform::kEventRead) && client_buffer(*conn).empty()) {
                             release_connection(runtime_.get(), conn);
                             continue;
                         }
@@ -1838,6 +1935,8 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
             }
             if (!ok) {
                 release_connection(runtime_.get(), conn);
+            } else if (conn->in_use && conn->client_fd >= 0) {
+                refresh_connection_timeout(runtime_.get(), conn, now);
             }
         }
         reap_idle(runtime_.get(), now);

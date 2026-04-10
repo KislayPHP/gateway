@@ -7,6 +7,8 @@ namespace kislay {
 namespace gateway {
 namespace core {
 
+static constexpr std::size_t kHttpHeaderLimit = 8192;
+
 enum class ParseStatus {
     NeedMore = 0,
     Ok,

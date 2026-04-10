@@ -103,7 +103,7 @@ ParseStatus ParseRequestHead(const char *buffer,
                             const char **error_out) {
     const char *header_end = find_header_end(buffer, length);
     if (header_end == nullptr) {
-        if (length >= 16384) {
+        if (length >= kHttpHeaderLimit) {
             if (error_out) {
                 *error_out = kHeaderTooLarge;
             }
@@ -113,7 +113,7 @@ ParseStatus ParseRequestHead(const char *buffer,
     }
 
     const std::size_t headers_end = static_cast<std::size_t>(header_end - buffer);
-    if (headers_end > 16384) {
+    if (headers_end > kHttpHeaderLimit) {
         if (error_out) {
             *error_out = kHeaderTooLarge;
         }
@@ -271,7 +271,7 @@ ParseStatus ParseResponseHead(const char *buffer,
                              const char **error_out) {
     const char *header_end = find_header_end(buffer, length);
     if (header_end == nullptr) {
-        if (length >= 16384) {
+        if (length >= kHttpHeaderLimit) {
             if (error_out) {
                 *error_out = kHeaderTooLarge;
             }
@@ -281,7 +281,7 @@ ParseStatus ParseResponseHead(const char *buffer,
     }
 
     const std::size_t headers_end = static_cast<std::size_t>(header_end - buffer);
-    if (headers_end > 16384) {
+    if (headers_end > kHttpHeaderLimit) {
         if (error_out) {
             *error_out = kHeaderTooLarge;
         }

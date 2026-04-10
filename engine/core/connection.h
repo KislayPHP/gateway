@@ -11,6 +11,9 @@ namespace kislay {
 namespace gateway {
 namespace core {
 
+static constexpr std::size_t kHeaderBufferBytes = 8192;
+static constexpr std::size_t kMaxHeaderRefs = 64;
+
 enum class ConnState {
     ReadClientHeaders = 0,
     ReadClientBody,
@@ -35,6 +38,18 @@ struct CoreTag {
     Connection *conn;
 };
 
+struct ConnectionBuffers {
+    FixedBuffer<kHeaderBufferBytes> client_buffer;
+    FixedBuffer<kHeaderBufferBytes> upstream_buffer;
+    RequestHead request;
+    ResponseHead response;
+    HeaderRef request_headers[kMaxHeaderRefs];
+    HeaderRef response_headers[kMaxHeaderRefs];
+
+    ConnectionBuffers();
+    void Reset();
+};
+
 struct Connection {
     uint32_t generation;
     int client_fd;
@@ -44,12 +59,7 @@ struct Connection {
     uint32_t upstream_events;
     uint32_t client_token_generation;
     uint32_t upstream_token_generation;
-    FixedBuffer<32768> client_buffer;
-    FixedBuffer<32768> upstream_buffer;
-    RequestHead request;
-    ResponseHead response;
-    HeaderRef request_headers[64];
-    HeaderRef response_headers[64];
+    ConnectionBuffers *buffers;
     const RouteSnapshotEntry *route;
     const UpstreamTarget *upstream_target;
     CoreTag client_tag;
@@ -84,6 +94,11 @@ struct Connection {
     uint64_t response_body_forwarded;
     uint64_t remaining_bytes;
     uint64_t last_progress_ms;
+    uint64_t deadline_ms;
+    uint32_t timer_prev;
+    uint32_t timer_next;
+    uint32_t timer_slot;
+    bool timer_armed;
 
     Connection();
     void Reset(int fd);

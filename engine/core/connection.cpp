@@ -4,6 +4,17 @@ namespace kislay {
 namespace gateway {
 namespace core {
 
+ConnectionBuffers::ConnectionBuffers() {
+    Reset();
+}
+
+void ConnectionBuffers::Reset() {
+    client_buffer.clear();
+    upstream_buffer.clear();
+    request = RequestHead();
+    response = ResponseHead();
+}
+
 Connection::Connection()
     : generation(0),
       client_fd(-1),
@@ -13,6 +24,7 @@ Connection::Connection()
       upstream_events(0),
       client_token_generation(0),
       upstream_token_generation(0),
+      buffers(nullptr),
       route(nullptr),
       upstream_target(nullptr),
       pipefd{-1, -1},
@@ -44,9 +56,12 @@ Connection::Connection()
       response_body_expected(0),
       response_body_forwarded(0),
       remaining_bytes(0),
-      last_progress_ms(0) {
-    request = RequestHead();
-    response = ResponseHead();
+      last_progress_ms(0),
+      deadline_ms(0),
+      timer_prev(UINT32_MAX),
+      timer_next(UINT32_MAX),
+      timer_slot(UINT32_MAX),
+      timer_armed(false) {
     client_tag.kind = CoreTag::Client;
     client_tag.conn = this;
     upstream_tag.kind = CoreTag::Upstream;
@@ -60,8 +75,9 @@ void Connection::Reset(int fd) {
     client_fd = fd;
     upstream_fd = -1;
     state = ConnState::ReadClientHeaders;
-    client_buffer.clear();
-    upstream_buffer.clear();
+    if (buffers != nullptr) {
+        buffers->Reset();
+    }
     route = nullptr;
     upstream_target = nullptr;
     client_events = 0;
@@ -97,8 +113,11 @@ void Connection::Reset(int fd) {
     response_body_forwarded = 0;
     remaining_bytes = 0;
     last_progress_ms = 0;
-    request = RequestHead();
-    response = ResponseHead();
+    deadline_ms = 0;
+    timer_prev = UINT32_MAX;
+    timer_next = UINT32_MAX;
+    timer_slot = UINT32_MAX;
+    timer_armed = false;
 }
 
 void Connection::ResetForNextRequest() {

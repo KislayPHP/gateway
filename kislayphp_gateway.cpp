@@ -74,6 +74,10 @@ typedef struct _php_kislayphp_gateway_t {
     zval resolver;
     bool has_resolver;
     std::shared_ptr<kislayphp_native_service_registry> native_services;
+    bool discovery_enabled;
+    std::string discovery_backend;
+    std::string discovery_path;
+    zend_long discovery_poll_ms;
     bool auth_required;
     std::string auth_bearer_token;
     std::vector<std::string> auth_exclude_prefixes;
@@ -342,6 +346,8 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->fallback_route) kislayphp_gateway_route();
     new (&obj->lock) std::mutex();
     new (&obj->native_services) std::shared_ptr<kislayphp_native_service_registry>();
+    new (&obj->discovery_backend) std::string();
+    new (&obj->discovery_path) std::string();
     new (&obj->auth_bearer_token) std::string();
     new (&obj->auth_exclude_prefixes) std::vector<std::string>();
     new (&obj->jwt_secret) std::string();
@@ -368,6 +374,16 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     ZVAL_UNDEF(&obj->resolver);
     obj->has_resolver = false;
     obj->native_services = std::make_shared<kislayphp_native_service_registry>();
+    obj->discovery_enabled = false;
+    obj->discovery_backend = kislayphp_env_string("KISLAY_GATEWAY_DISCOVERY_BACKEND", "");
+    obj->discovery_path = kislayphp_env_string("KISLAY_GATEWAY_DISCOVERY_PATH", "");
+    obj->discovery_poll_ms = kislayphp_env_long("KISLAY_GATEWAY_DISCOVERY_POLL_MS", 1000);
+    if (obj->discovery_poll_ms < 100) {
+        obj->discovery_poll_ms = 100;
+    }
+    if (!obj->discovery_backend.empty() && obj->discovery_backend != "static" && obj->discovery_backend != "none") {
+        obj->discovery_enabled = true;
+    }
     obj->auth_required = kislayphp_env_bool("KISLAY_GATEWAY_AUTH_REQUIRED", false);
     obj->auth_bearer_token = kislayphp_env_string("KISLAY_GATEWAY_AUTH_TOKEN", "");
     obj->auth_exclude_prefixes = kislayphp_split_csv(
@@ -412,6 +428,8 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     obj->epoll_server.~unique_ptr();
     obj->runtime_engine_override.~basic_string();
     obj->native_services.~shared_ptr();
+    obj->discovery_path.~basic_string();
+    obj->discovery_backend.~basic_string();
     obj->circuit_states.~unordered_map();
     obj->rate_limits.~unordered_map();
     obj->auth_user_header.~basic_string();
@@ -680,6 +698,90 @@ static bool kislayphp_gateway_register_service_targets_internal(
     return true;
 }
 
+static bool kislayphp_gateway_set_discovery_backend_internal(php_kislayphp_gateway_t *gateway,
+                                                             zval *config,
+                                                             std::string *error_out) {
+    if (gateway == nullptr || config == nullptr || Z_TYPE_P(config) != IS_ARRAY) {
+        if (error_out != nullptr) {
+            *error_out = "Discovery backend config must be an array";
+        }
+        return false;
+    }
+    if (!kislayphp_gateway_ensure_config_mutable(gateway, "setDiscoveryBackend()", error_out)) {
+        return false;
+    }
+
+    std::string backend = gateway->discovery_backend;
+    std::string path = gateway->discovery_path;
+    zend_long poll_ms = gateway->discovery_poll_ms;
+
+    zval *value = zend_hash_str_find(Z_ARRVAL_P(config), "backend", sizeof("backend") - 1);
+    if (value != nullptr) {
+        if (Z_TYPE_P(value) != IS_STRING) {
+            if (error_out != nullptr) {
+                *error_out = "discovery backend must be a string";
+            }
+            return false;
+        }
+        backend.assign(Z_STRVAL_P(value), Z_STRLEN_P(value));
+    }
+
+    value = zend_hash_str_find(Z_ARRVAL_P(config), "path", sizeof("path") - 1);
+    if (value != nullptr) {
+        if (Z_TYPE_P(value) != IS_STRING) {
+            if (error_out != nullptr) {
+                *error_out = "discovery path must be a string";
+            }
+            return false;
+        }
+        path.assign(Z_STRVAL_P(value), Z_STRLEN_P(value));
+    }
+
+    value = zend_hash_str_find(Z_ARRVAL_P(config), "poll_ms", sizeof("poll_ms") - 1);
+    if (value != nullptr) {
+        if (Z_TYPE_P(value) != IS_LONG) {
+            if (error_out != nullptr) {
+                *error_out = "discovery poll_ms must be an integer";
+            }
+            return false;
+        }
+        poll_ms = Z_LVAL_P(value);
+    }
+
+    if (poll_ms < 100) {
+        poll_ms = 100;
+    }
+
+    if (backend.empty() || backend == "none" || backend == "static") {
+        std::lock_guard<std::mutex> guard(gateway->lock);
+        gateway->discovery_enabled = false;
+        gateway->discovery_backend = "static";
+        gateway->discovery_path.clear();
+        gateway->discovery_poll_ms = poll_ms;
+        return true;
+    }
+
+    if (backend != "file") {
+        if (error_out != nullptr) {
+            *error_out = "unsupported discovery backend; use 'file' or 'static'";
+        }
+        return false;
+    }
+    if (path.empty()) {
+        if (error_out != nullptr) {
+            *error_out = "file discovery backend requires 'path'";
+        }
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(gateway->lock);
+    gateway->discovery_enabled = true;
+    gateway->discovery_backend = backend;
+    gateway->discovery_path = path;
+    gateway->discovery_poll_ms = poll_ms;
+    return true;
+}
+
 static bool kislayphp_gateway_set_fallback_target_internal(php_kislayphp_gateway_t *gateway,
                                                            const std::string &target,
                                                            std::string *error_out) {
@@ -815,6 +917,20 @@ static bool kislayphp_build_epoll_config(php_kislayphp_gateway_t *gateway,
     config->listen_port = static_cast<uint16_t>(port);
     config->worker_processes = gateway->thread_count > 0 ? gateway->thread_count : 0;
     config->max_body_bytes = gateway->max_body_bytes;
+    if (gateway->discovery_enabled) {
+        if (gateway->discovery_backend == "file") {
+            config->discovery.enabled = true;
+            config->discovery.backend = kislay::gateway::core::DiscoveryConfig::Backend::File;
+            config->discovery.path = gateway->discovery_path;
+            config->discovery.poll_ms =
+                gateway->discovery_poll_ms > 0 ? static_cast<uint64_t>(gateway->discovery_poll_ms) : 1000ull;
+        } else if (!gateway->discovery_backend.empty() && gateway->discovery_backend != "static") {
+            if (error_out != nullptr) {
+                *error_out = "unsupported native discovery backend: " + gateway->discovery_backend;
+            }
+            return false;
+        }
+    }
 
     std::lock_guard<std::mutex> guard(gateway->lock);
     for (std::size_t i = 0; i < gateway->routes.size(); ++i) {
@@ -931,6 +1047,13 @@ static bool kislayphp_gateway_apply_start_config(php_kislayphp_gateway_t *gatewa
         }
         gateway->thread_count = kislayphp_normalize_native_worker_count(
             static_cast<int>(Z_LVAL_P(value)), "Kislay\\Gateway\\Gateway::start");
+    }
+
+    value = zend_hash_str_find(Z_ARRVAL_P(config), "discovery", sizeof("discovery") - 1);
+    if (value != nullptr) {
+        if (!kislayphp_gateway_set_discovery_backend_internal(gateway, value, error_out)) {
+            return false;
+        }
     }
 
     value = zend_hash_str_find(Z_ARRVAL_P(config), "max_body_bytes", sizeof("max_body_bytes") - 1);
@@ -2017,6 +2140,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_resolver, 0, 0, 1)
     ZEND_ARG_CALLABLE_INFO(0, resolver, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_discovery_backend, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, config, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_fallback, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, target, IS_STRING, 0)
 ZEND_END_ARG_INFO()
@@ -2188,6 +2315,21 @@ PHP_METHOD(KislayPHPGateway, setResolver) {
     RETURN_TRUE;
 }
 
+PHP_METHOD(KislayPHPGateway, setDiscoveryBackend) {
+    zval *config = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(config)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    std::string error;
+    if (!kislayphp_gateway_set_discovery_backend_internal(obj, config, &error)) {
+        zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
 PHP_METHOD(KislayPHPGateway, listen) {
     char *host = nullptr;
     size_t host_len = 0;
@@ -2328,6 +2470,7 @@ static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, routes, arginfo_kislayphp_gateway_void, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setThreads, arginfo_kislayphp_gateway_set_threads, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setResolver, arginfo_kislayphp_gateway_set_resolver, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setDiscoveryBackend, arginfo_kislayphp_gateway_set_discovery_backend, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setFallbackTarget, arginfo_kislayphp_gateway_set_fallback, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setFallbackService, arginfo_kislayphp_gateway_set_fallback_service, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, listen, arginfo_kislayphp_gateway_listen, ZEND_ACC_PUBLIC)

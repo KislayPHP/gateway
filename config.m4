@@ -33,7 +33,7 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
     RPC_SRCS=""
   fi
 
-  EPOLL_SRCS="engine/core/connection.cpp engine/core/http_parser.cpp engine/core/proxy_engine.cpp engine/epoll/epoll_loop.cpp engine/kqueue/kqueue_loop.cpp engine/epoll/epoll_server.cpp"
+  EPOLL_SRCS="engine/core/connection.cpp engine/core/http_parser.cpp engine/core/timer_wheel.cpp engine/core/discovery_manager.cpp engine/core/proxy_engine.cpp engine/epoll/epoll_loop.cpp engine/kqueue/kqueue_loop.cpp engine/epoll/epoll_server.cpp"
 
   PHP_NEW_EXTENSION(kislayphp_gateway, kislayphp_gateway.cpp third_party/civetweb/src/civetweb.c $EPOLL_SRCS $RPC_SRCS, $ext_shared)
 fi

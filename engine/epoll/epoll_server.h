@@ -24,6 +24,7 @@ struct EpollServerConfig {
     std::size_t max_body_bytes;
     std::size_t max_connections;
     std::string runtime_engine;
+    core::DiscoveryConfig discovery;
     RouteSnapshot snapshot;
 
     EpollServerConfig()

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -25,9 +26,65 @@ struct ControlRoute {
 struct ServiceRegistryEntry {
     std::string service;
     std::vector<UpstreamTarget> targets;
+};
+
+struct ServiceDefinition {
+    uint32_t id;
+    std::string service;
+    std::vector<UpstreamTarget> targets;
+
+    ServiceDefinition() : id(UINT32_MAX) {}
+};
+
+struct ServiceTargetSet {
+    std::vector<UpstreamTarget> targets;
     mutable uint32_t next_index;
 
-    ServiceRegistryEntry() : next_index(0) {}
+    ServiceTargetSet() : next_index(0) {}
+};
+
+class ServiceSnapshot {
+public:
+    ServiceSnapshot() = default;
+
+    void Add(const ServiceDefinition &definition) {
+        if (definition.id >= services_.size()) {
+            services_.resize(static_cast<std::size_t>(definition.id) + 1);
+        }
+        services_[definition.id].targets = definition.targets;
+        services_[definition.id].next_index = 0;
+    }
+
+    bool Resolve(uint32_t service_id, const UpstreamTarget **target) const {
+        if (target == nullptr || service_id >= services_.size()) {
+            return false;
+        }
+        const ServiceTargetSet &set = services_[service_id];
+        if (set.targets.empty()) {
+            return false;
+        }
+        if (set.targets.size() == 1) {
+            *target = &set.targets[0];
+            return true;
+        }
+        const uint32_t slot = set.next_index++ % static_cast<uint32_t>(set.targets.size());
+        *target = &set.targets[slot];
+        return true;
+    }
+
+    std::size_t size() const {
+        return services_.size();
+    }
+
+    const ServiceTargetSet *Find(uint32_t service_id) const {
+        if (service_id >= services_.size()) {
+            return nullptr;
+        }
+        return &services_[service_id];
+    }
+
+private:
+    std::vector<ServiceTargetSet> services_;
 };
 
 struct RouteSnapshotEntry {
@@ -35,17 +92,16 @@ struct RouteSnapshotEntry {
     std::string path;
     bool wildcard;
     bool use_service;
+    uint32_t service_id;
     std::string service;
-    const ServiceRegistryEntry *service_entry;
     UpstreamTarget target;
 
-    RouteSnapshotEntry() : wildcard(false), use_service(false), service_entry(nullptr) {}
+    RouteSnapshotEntry()
+        : wildcard(false), use_service(false), service_id(UINT32_MAX) {}
 };
 
 class RouteSnapshot {
 public:
-    typedef std::unordered_map<std::string, ServiceRegistryEntry>::iterator service_iterator;
-
     RouteSnapshot() : has_fallback_(false) {}
 
     void AddRoute(const ControlRoute &route) {
@@ -70,7 +126,20 @@ public:
     }
 
     void AddService(const ServiceRegistryEntry &service) {
-        services_[service.service] = service;
+        uint32_t id = UINT32_MAX;
+        std::unordered_map<std::string, uint32_t>::const_iterator existing = service_ids_.find(service.service);
+        if (existing != service_ids_.end()) {
+            id = existing->second;
+            service_definitions_[id].targets = service.targets;
+            return;
+        }
+        id = static_cast<uint32_t>(service_definitions_.size());
+        service_ids_[service.service] = id;
+        ServiceDefinition definition;
+        definition.id = id;
+        definition.service = service.service;
+        definition.targets = service.targets;
+        service_definitions_.push_back(definition);
     }
 
     void Finalize() {
@@ -78,14 +147,14 @@ public:
         prefix_.clear();
         for (std::size_t i = 0; i < routes_.size(); ++i) {
             RouteSnapshotEntry &entry = routes_[i];
-            entry.service_entry = bind_service(entry);
+            bind_service(entry);
             if (!entry.wildcard && entry.method != "*") {
                 exact_[HashPair(entry.method.data(), entry.method.size(), entry.path.data(), entry.path.size())] = &entry;
             } else {
                 prefix_.push_back(&entry);
             }
         }
-        fallback_.service_entry = bind_service(fallback_);
+        bind_service(fallback_);
         std::sort(prefix_.begin(), prefix_.end(), [](const RouteSnapshotEntry *a, const RouteSnapshotEntry *b) {
             return a->path.size() > b->path.size();
         });
@@ -128,7 +197,9 @@ public:
         return has_fallback_ ? &fallback_ : nullptr;
     }
 
-    bool Resolve(const RouteSnapshotEntry *entry, const UpstreamTarget **target) const {
+    bool Resolve(const RouteSnapshotEntry *entry,
+                 const ServiceSnapshot *services,
+                 const UpstreamTarget **target) const {
         if (entry == nullptr || target == nullptr) {
             return false;
         }
@@ -136,36 +207,34 @@ public:
             *target = &entry->target;
             return true;
         }
-        const ServiceRegistryEntry *bound = entry->service_entry;
-        if (bound == nullptr || bound->targets.empty()) {
+        if (services == nullptr || entry->service_id == UINT32_MAX) {
             return false;
         }
-        ServiceRegistryEntry &svc = const_cast<ServiceRegistryEntry &>(*bound);
-        if (svc.targets.size() == 1) {
-            *target = &svc.targets[0];
-            return true;
-        }
-        const std::size_t idx = svc.next_index++ % svc.targets.size();
-        *target = &svc.targets[idx];
-        return true;
+        return services->Resolve(entry->service_id, target);
     }
 
+    std::shared_ptr<ServiceSnapshot> BuildInitialServiceSnapshot() const {
+        std::shared_ptr<ServiceSnapshot> snapshot = std::make_shared<ServiceSnapshot>();
+        for (std::size_t i = 0; i < service_definitions_.size(); ++i) {
+            snapshot->Add(service_definitions_[i]);
+        }
+        return snapshot;
+    }
+
+    const std::vector<ServiceDefinition> &service_definitions() const { return service_definitions_; }
+    std::vector<ServiceDefinition> &mutable_service_definitions() { return service_definitions_; }
     std::vector<RouteSnapshotEntry> &mutable_routes() { return routes_; }
-    service_iterator services_begin() { return services_.begin(); }
-    service_iterator services_end() { return services_.end(); }
     bool has_fallback() const { return has_fallback_; }
     RouteSnapshotEntry *mutable_fallback() { return has_fallback_ ? &fallback_ : nullptr; }
 
 private:
-    const ServiceRegistryEntry *bind_service(const RouteSnapshotEntry &entry) {
+    void bind_service(RouteSnapshotEntry &entry) {
         if (!entry.use_service || entry.service.empty()) {
-            return nullptr;
+            entry.service_id = UINT32_MAX;
+            return;
         }
-        std::unordered_map<std::string, ServiceRegistryEntry>::iterator it = services_.find(entry.service);
-        if (it == services_.end()) {
-            return nullptr;
-        }
-        return &it->second;
+        std::unordered_map<std::string, uint32_t>::const_iterator it = service_ids_.find(entry.service);
+        entry.service_id = (it == service_ids_.end()) ? UINT32_MAX : it->second;
     }
 
     static uint64_t HashPair(const char *method, std::size_t method_len,
@@ -187,7 +256,8 @@ private:
     std::vector<RouteSnapshotEntry> routes_;
     std::unordered_map<uint64_t, const RouteSnapshotEntry *> exact_;
     std::vector<const RouteSnapshotEntry *> prefix_;
-    std::unordered_map<std::string, ServiceRegistryEntry> services_;
+    std::vector<ServiceDefinition> service_definitions_;
+    std::unordered_map<std::string, uint32_t> service_ids_;
     RouteSnapshotEntry fallback_;
     bool has_fallback_;
 };

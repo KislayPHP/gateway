@@ -1,6 +1,7 @@
 #pragma once
 
 #include "connection.h"
+#include "discovery_manager.h"
 #include "router_adapter.h"
 #include "../interface/event_loop.h"
 
@@ -19,6 +20,7 @@ struct ProxyEngineConfig {
     int worker_index;
     std::size_t max_body_bytes;
     std::size_t max_connections;
+    DiscoveryConfig discovery;
     RouteSnapshot snapshot;
 
     ProxyEngineConfig() : listener_fd(-1), worker_index(0), max_body_bytes(0), max_connections(16384) {}
