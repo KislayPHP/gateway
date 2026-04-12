@@ -4,7 +4,7 @@ PHP_ARG_ENABLE(kislayphp_gateway, whether to enable kislayphp_gateway,
 if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
   PHP_REQUIRE_CXX()
 
-  CIVETWEB_INCLUDE_DIR=`pwd`/third_party/civetweb/include
+  CIVETWEB_INCLUDE_DIR=$abs_srcdir/third_party/civetweb/include
   PHP_ADD_INCLUDE($CIVETWEB_INCLUDE_DIR)
 
   PKG_CHECK_MODULES([OPENSSL], [openssl])
@@ -12,17 +12,17 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
   PHP_EVAL_LIBLINE($OPENSSL_LIBS, KISLAYPHP_GATEWAY_SHARED_LIBADD)
   PHP_ADD_LIBRARY(stdc++,, KISLAYPHP_GATEWAY_SHARED_LIBADD)
   PHP_SUBST(KISLAYPHP_GATEWAY_SHARED_LIBADD)
-  PHP_ADD_INCLUDE(`pwd`/engine/epoll)
-  PHP_ADD_INCLUDE(`pwd`/engine/core)
-  PHP_ADD_INCLUDE(`pwd`/engine/interface)
-  PHP_ADD_INCLUDE(`pwd`/engine/kqueue)
+  PHP_ADD_INCLUDE($abs_srcdir/engine/epoll)
+  PHP_ADD_INCLUDE($abs_srcdir/engine/core)
+  PHP_ADD_INCLUDE($abs_srcdir/engine/interface)
+  PHP_ADD_INCLUDE($abs_srcdir/engine/kqueue)
 
   CFLAGS="$CFLAGS -DOPENSSL_API_3_0"
   CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0"
-  if test -f ../rpc/gen/discovery.pb.cc; then
-    RPC_GEN_DIR=`pwd`/../rpc/gen
+  if test -f $abs_srcdir/../rpc/gen/discovery.pb.cc; then
+    RPC_GEN_DIR=$abs_srcdir/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)
-    PHP_ADD_INCLUDE(`pwd`/../rpc)
+    PHP_ADD_INCLUDE($abs_srcdir/../rpc)
     PKG_CHECK_MODULES([GRPC], [grpc++])
     PHP_EVAL_INCLINE($GRPC_CFLAGS)
     PHP_EVAL_LIBLINE($GRPC_LIBS, KISLAYPHP_GATEWAY_SHARED_LIBADD)

@@ -260,6 +260,12 @@ bool EpollServer::Start(std::string *error_out) {
     if (running_) {
         return true;
     }
+    if (config_.tls.enabled) {
+        if (error_out != nullptr) {
+            *error_out = "native TLS termination is configured but not implemented yet";
+        }
+        return false;
+    }
     {
         std::string probe_error;
         std::unique_ptr<platform::EventLoop> probe = create_event_loop(config_.runtime_engine, &probe_error);

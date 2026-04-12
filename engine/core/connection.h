@@ -51,6 +51,8 @@ struct ConnectionBuffers {
 };
 
 struct Connection {
+    static constexpr uint32_t kNoChunk = UINT32_MAX;
+
     uint32_t generation;
     int client_fd;
     int upstream_fd;
@@ -88,6 +90,12 @@ struct Connection {
     bool splice_eof;
     bool passthrough_response_headers;
     bool response_started;
+    uint32_t request_chunk_head;
+    uint32_t request_chunk_tail;
+    uint32_t request_chunk_count;
+    uint32_t response_chunk_head;
+    uint32_t response_chunk_tail;
+    uint32_t response_chunk_count;
     uint64_t request_body_expected;
     uint64_t request_body_forwarded;
     uint64_t response_body_expected;

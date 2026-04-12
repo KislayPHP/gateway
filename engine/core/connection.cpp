@@ -51,6 +51,12 @@ Connection::Connection()
       splice_eof(false),
       passthrough_response_headers(false),
       response_started(false),
+      request_chunk_head(Connection::kNoChunk),
+      request_chunk_tail(Connection::kNoChunk),
+      request_chunk_count(0),
+      response_chunk_head(Connection::kNoChunk),
+      response_chunk_tail(Connection::kNoChunk),
+      response_chunk_count(0),
       request_body_expected(0),
       request_body_forwarded(0),
       response_body_expected(0),
@@ -107,6 +113,12 @@ void Connection::Reset(int fd) {
     splice_eof = false;
     passthrough_response_headers = false;
     response_started = false;
+    request_chunk_head = kNoChunk;
+    request_chunk_tail = kNoChunk;
+    request_chunk_count = 0;
+    response_chunk_head = kNoChunk;
+    response_chunk_tail = kNoChunk;
+    response_chunk_count = 0;
     request_body_expected = 0;
     request_body_forwarded = 0;
     response_body_expected = 0;

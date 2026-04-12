@@ -74,6 +74,10 @@ typedef struct _php_kislayphp_gateway_t {
     zval resolver;
     bool has_resolver;
     std::shared_ptr<kislayphp_native_service_registry> native_services;
+    bool tls_enabled;
+    std::string tls_cert_path;
+    std::string tls_key_path;
+    std::string tls_min_version;
     bool discovery_enabled;
     std::string discovery_backend;
     std::string discovery_path;
@@ -346,6 +350,9 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->fallback_route) kislayphp_gateway_route();
     new (&obj->lock) std::mutex();
     new (&obj->native_services) std::shared_ptr<kislayphp_native_service_registry>();
+    new (&obj->tls_cert_path) std::string();
+    new (&obj->tls_key_path) std::string();
+    new (&obj->tls_min_version) std::string();
     new (&obj->discovery_backend) std::string();
     new (&obj->discovery_path) std::string();
     new (&obj->auth_bearer_token) std::string();
@@ -374,6 +381,14 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     ZVAL_UNDEF(&obj->resolver);
     obj->has_resolver = false;
     obj->native_services = std::make_shared<kislayphp_native_service_registry>();
+    obj->tls_enabled = false;
+    obj->tls_cert_path = kislayphp_env_string("KISLAY_GATEWAY_TLS_CERT", "");
+    obj->tls_key_path = kislayphp_env_string("KISLAY_GATEWAY_TLS_KEY", "");
+    obj->tls_min_version = kislayphp_env_string("KISLAY_GATEWAY_TLS_MIN_VERSION", "tls1.2");
+    if ((!obj->tls_cert_path.empty() || !obj->tls_key_path.empty()) &&
+        (!obj->tls_cert_path.empty() && !obj->tls_key_path.empty())) {
+        obj->tls_enabled = true;
+    }
     obj->discovery_enabled = false;
     obj->discovery_backend = kislayphp_env_string("KISLAY_GATEWAY_DISCOVERY_BACKEND", "");
     obj->discovery_path = kislayphp_env_string("KISLAY_GATEWAY_DISCOVERY_PATH", "");
@@ -428,6 +443,9 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     obj->epoll_server.~unique_ptr();
     obj->runtime_engine_override.~basic_string();
     obj->native_services.~shared_ptr();
+    obj->tls_min_version.~basic_string();
+    obj->tls_key_path.~basic_string();
+    obj->tls_cert_path.~basic_string();
     obj->discovery_path.~basic_string();
     obj->discovery_backend.~basic_string();
     obj->circuit_states.~unordered_map();
@@ -782,6 +800,67 @@ static bool kislayphp_gateway_set_discovery_backend_internal(php_kislayphp_gatew
     return true;
 }
 
+static bool kislayphp_gateway_set_tls_internal(php_kislayphp_gateway_t *gateway,
+                                               zval *config,
+                                               std::string *error_out) {
+    if (gateway == nullptr || config == nullptr || Z_TYPE_P(config) != IS_ARRAY) {
+        if (error_out != nullptr) {
+            *error_out = "TLS config must be an array";
+        }
+        return false;
+    }
+    if (!kislayphp_gateway_ensure_config_mutable(gateway, "setTls()", error_out)) {
+        return false;
+    }
+
+    zval *cert_val = zend_hash_str_find(Z_ARRVAL_P(config), "cert", sizeof("cert") - 1);
+    zval *key_val = zend_hash_str_find(Z_ARRVAL_P(config), "key", sizeof("key") - 1);
+    zval *min_version_val =
+        zend_hash_str_find(Z_ARRVAL_P(config), "min_version", sizeof("min_version") - 1);
+
+    if (cert_val == nullptr || Z_TYPE_P(cert_val) != IS_STRING ||
+        Z_STRLEN_P(cert_val) == 0) {
+        if (error_out != nullptr) {
+            *error_out = "TLS config requires a non-empty 'cert' string";
+        }
+        return false;
+    }
+    if (key_val == nullptr || Z_TYPE_P(key_val) != IS_STRING ||
+        Z_STRLEN_P(key_val) == 0) {
+        if (error_out != nullptr) {
+            *error_out = "TLS config requires a non-empty 'key' string";
+        }
+        return false;
+    }
+
+    std::string min_version = "tls1.2";
+    if (min_version_val != nullptr) {
+        if (Z_TYPE_P(min_version_val) != IS_STRING || Z_STRLEN_P(min_version_val) == 0) {
+            if (error_out != nullptr) {
+                *error_out = "TLS config 'min_version' must be a non-empty string";
+            }
+            return false;
+        }
+        min_version.assign(Z_STRVAL_P(min_version_val), Z_STRLEN_P(min_version_val));
+        std::transform(min_version.begin(), min_version.end(), min_version.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        if (min_version != "tls1.2" && min_version != "tls1.3") {
+            if (error_out != nullptr) {
+                *error_out = "TLS config 'min_version' must be 'tls1.2' or 'tls1.3'";
+            }
+            return false;
+        }
+    }
+
+    std::lock_guard<std::mutex> guard(gateway->lock);
+    gateway->tls_enabled = true;
+    gateway->tls_cert_path.assign(Z_STRVAL_P(cert_val), Z_STRLEN_P(cert_val));
+    gateway->tls_key_path.assign(Z_STRVAL_P(key_val), Z_STRLEN_P(key_val));
+    gateway->tls_min_version = min_version;
+    return true;
+}
+
 static bool kislayphp_gateway_set_fallback_target_internal(php_kislayphp_gateway_t *gateway,
                                                            const std::string &target,
                                                            std::string *error_out) {
@@ -912,11 +991,22 @@ static bool kislayphp_build_epoll_config(php_kislayphp_gateway_t *gateway,
         }
         return false;
     }
+    if ((!gateway->tls_cert_path.empty() || !gateway->tls_key_path.empty()) &&
+        (gateway->tls_cert_path.empty() || gateway->tls_key_path.empty())) {
+        if (error_out != nullptr) {
+            *error_out = "TLS config requires both certificate and key paths";
+        }
+        return false;
+    }
 
     config->listen_host.assign(host, host_len);
     config->listen_port = static_cast<uint16_t>(port);
     config->worker_processes = gateway->thread_count > 0 ? gateway->thread_count : 0;
     config->max_body_bytes = gateway->max_body_bytes;
+    config->tls.enabled = gateway->tls_enabled;
+    config->tls.cert_path = gateway->tls_cert_path;
+    config->tls.key_path = gateway->tls_key_path;
+    config->tls.min_version = gateway->tls_min_version.empty() ? "tls1.2" : gateway->tls_min_version;
     if (gateway->discovery_enabled) {
         if (gateway->discovery_backend == "file") {
             config->discovery.enabled = true;
@@ -1247,6 +1337,12 @@ static bool kislayphp_gateway_listen_internal(php_kislayphp_gateway_t *gateway,
         }
         gateway->running = true;
         return true;
+    }
+    if (gateway->tls_enabled) {
+        if (error_out != nullptr) {
+            *error_out = "setTls() currently requires the native gateway engine";
+        }
+        return false;
     }
 
     if (gateway->thread_count == 0) {
@@ -2144,6 +2240,10 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_discovery_backend, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, config, IS_ARRAY, 0)
 ZEND_END_ARG_INFO()
 
+ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_tls, 0, 0, 1)
+    ZEND_ARG_TYPE_INFO(0, config, IS_ARRAY, 0)
+ZEND_END_ARG_INFO()
+
 ZEND_BEGIN_ARG_INFO_EX(arginfo_kislayphp_gateway_set_fallback, 0, 0, 1)
     ZEND_ARG_TYPE_INFO(0, target, IS_STRING, 0)
 ZEND_END_ARG_INFO()
@@ -2330,6 +2430,21 @@ PHP_METHOD(KislayPHPGateway, setDiscoveryBackend) {
     RETURN_TRUE;
 }
 
+PHP_METHOD(KislayPHPGateway, setTls) {
+    zval *config = nullptr;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ARRAY(config)
+    ZEND_PARSE_PARAMETERS_END();
+
+    php_kislayphp_gateway_t *obj = php_kislayphp_gateway_from_obj(Z_OBJ_P(getThis()));
+    std::string error;
+    if (!kislayphp_gateway_set_tls_internal(obj, config, &error)) {
+        zend_throw_exception(zend_ce_exception, error.c_str(), 0);
+        RETURN_FALSE;
+    }
+    RETURN_TRUE;
+}
+
 PHP_METHOD(KislayPHPGateway, listen) {
     char *host = nullptr;
     size_t host_len = 0;
@@ -2471,6 +2586,7 @@ static const zend_function_entry kislayphp_gateway_methods[] = {
     PHP_ME(KislayPHPGateway, setThreads, arginfo_kislayphp_gateway_set_threads, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setResolver, arginfo_kislayphp_gateway_set_resolver, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setDiscoveryBackend, arginfo_kislayphp_gateway_set_discovery_backend, ZEND_ACC_PUBLIC)
+    PHP_ME(KislayPHPGateway, setTls, arginfo_kislayphp_gateway_set_tls, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setFallbackTarget, arginfo_kislayphp_gateway_set_fallback, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, setFallbackService, arginfo_kislayphp_gateway_set_fallback_service, ZEND_ACC_PUBLIC)
     PHP_ME(KislayPHPGateway, listen, arginfo_kislayphp_gateway_listen, ZEND_ACC_PUBLIC)
