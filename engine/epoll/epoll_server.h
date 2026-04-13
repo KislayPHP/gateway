@@ -16,16 +16,6 @@ using RouteSnapshotEntry = core::RouteSnapshotEntry;
 using RouteSnapshot = core::RouteSnapshot;
 using UpstreamTarget = core::UpstreamTarget;
 
-struct TlsConfig {
-    bool enabled;
-    std::string cert_path;
-    std::string key_path;
-    std::string min_version;
-
-    TlsConfig()
-        : enabled(false), min_version("tls1.2") {}
-};
-
 struct EpollServerConfig {
     std::string listen_host;
     uint16_t listen_port;
@@ -34,7 +24,7 @@ struct EpollServerConfig {
     std::size_t max_body_bytes;
     std::size_t max_connections;
     std::string runtime_engine;
-    TlsConfig tls;
+    core::TlsConfig tls;
     core::DiscoveryConfig discovery;
     RouteSnapshot snapshot;
 

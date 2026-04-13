@@ -237,6 +237,7 @@ static int run_worker(EpollServerConfig config) {
     proxy_config.worker_index = config.worker_index;
     proxy_config.max_body_bytes = config.max_body_bytes;
     proxy_config.max_connections = config.max_connections;
+    proxy_config.tls = config.tls;
     proxy_config.discovery = config.discovery;
     proxy_config.snapshot = config.snapshot;
 
@@ -259,12 +260,6 @@ EpollServer::~EpollServer() {
 bool EpollServer::Start(std::string *error_out) {
     if (running_) {
         return true;
-    }
-    if (config_.tls.enabled) {
-        if (error_out != nullptr) {
-            *error_out = "native TLS termination is configured but not implemented yet";
-        }
-        return false;
     }
     {
         std::string probe_error;

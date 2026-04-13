@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <signal.h>
 #include <string>
 #include <sys/resource.h>
@@ -132,6 +134,50 @@ static bool suppress_sigpipe(int fd, std::string *error_out) {
 static bool set_tcp_nodelay(int fd) {
     int one = 1;
     return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0;
+}
+
+static long tls_min_version_constant(const std::string &min_version) {
+    if (min_version == "tls1.3") {
+#ifdef TLS1_3_VERSION
+        return TLS1_3_VERSION;
+#else
+        return TLS1_2_VERSION;
+#endif
+    }
+    return TLS1_2_VERSION;
+}
+
+static bool configure_server_tls_context(SSL_CTX *ctx, const TlsConfig &config, std::string *error_out) {
+    if (ctx == nullptr) {
+        if (error_out != nullptr) {
+            *error_out = "failed to create SSL_CTX";
+        }
+        return false;
+    }
+
+    SSL_CTX_set_min_proto_version(ctx, static_cast<int>(tls_min_version_constant(config.min_version)));
+    SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE | SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, config.cert_path.c_str()) != 1) {
+        if (error_out != nullptr) {
+            *error_out = "failed to load TLS certificate chain";
+        }
+        return false;
+    }
+    if (SSL_CTX_use_PrivateKey_file(ctx, config.key_path.c_str(), SSL_FILETYPE_PEM) != 1) {
+        if (error_out != nullptr) {
+            *error_out = "failed to load TLS private key";
+        }
+        return false;
+    }
+    if (SSL_CTX_check_private_key(ctx) != 1) {
+        if (error_out != nullptr) {
+            *error_out = "TLS private key does not match certificate";
+        }
+        return false;
+    }
+    return true;
 }
 
 static bool build_sockaddr(const char *host,
@@ -336,6 +382,7 @@ struct WorkerRuntime {
     TimerWheel timers;
     std::vector<uint32_t> expired_connections;
     std::unordered_map<PoolKey, std::deque<PooledUpstream>, PoolKeyHash> upstream_pool;
+    SSL_CTX *client_tls_ctx;
     uint64_t last_upstream_pool_reap_ms;
     uint64_t total_requests;
     uint64_t active_connections;
@@ -352,6 +399,7 @@ struct WorkerRuntime {
         : listener_fd(-1),
           worker_index(0),
           max_body_bytes(0),
+          client_tls_ctx(nullptr),
           last_upstream_pool_reap_ms(0),
           total_requests(0),
           active_connections(0),
@@ -372,6 +420,7 @@ static uint64_t timeout_for_connection(const Connection *conn, TimeoutKind *kind
     uint64_t timeout_ms = 0;
 
     switch (conn->state) {
+        case ConnState::HandshakeClientTls:
         case ConnState::ReadClientHeaders:
             if (client_buffer(*conn).empty() && conn->keep_alive_idle) {
                 kind = TimeoutKind::IdleKeepAlive;
@@ -441,6 +490,15 @@ static uint32_t token_index(uint64_t token) {
 
 static uint32_t desired_client_events(const Connection *conn) {
     uint32_t events = platform::kEventEdge | platform::kEventReadHup;
+    if (conn->state == ConnState::HandshakeClientTls) {
+        if (conn->client_tls_want_read || (!conn->client_tls_want_read && !conn->client_tls_want_write)) {
+            events |= platform::kEventRead;
+        }
+        if (conn->client_tls_want_write || (!conn->client_tls_want_read && !conn->client_tls_want_write)) {
+            events |= platform::kEventWrite;
+        }
+        return events;
+    }
     switch (conn->state) {
         case ConnState::ReadClientHeaders:
             events |= platform::kEventRead;
@@ -463,6 +521,14 @@ static uint32_t desired_client_events(const Connection *conn) {
             break;
         default:
             break;
+    }
+    if (conn->client_tls_enabled && conn->client_tls_ready) {
+        if (conn->client_tls_want_read) {
+            events |= platform::kEventRead;
+        }
+        if (conn->client_tls_want_write) {
+            events |= platform::kEventWrite;
+        }
     }
     return events;
 }
@@ -510,6 +576,8 @@ static void loop_del(WorkerRuntime *rt, int fd) {
 
 static bool refresh_client_interest(WorkerRuntime *rt, Connection *conn);
 static bool refresh_upstream_interest(WorkerRuntime *rt, Connection *conn);
+static bool handle_client_tls_handshake(WorkerRuntime *rt, Connection *conn);
+static bool handle_client_header_read(WorkerRuntime *rt, Connection *conn);
 static bool finish_response(WorkerRuntime *rt, Connection *conn);
 static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn);
 static bool handle_upstream_read(WorkerRuntime *rt, Connection *conn);
@@ -791,6 +859,10 @@ static void release_connection(WorkerRuntime *rt, Connection *conn) {
             loop_del(rt, conn->client_fd);
             conn->client_registered = false;
             conn->client_token_generation = 0;
+        }
+        if (conn->client_ssl != nullptr) {
+            SSL_free(conn->client_ssl);
+            conn->client_ssl = nullptr;
         }
         close_fd(conn->client_fd);
     }
@@ -1202,6 +1274,185 @@ static bool flush_iov(int fd,
     }
 }
 
+static void clear_client_tls_block_state(Connection *conn) {
+    conn->client_tls_want_read = false;
+    conn->client_tls_want_write = false;
+}
+
+static bool handle_client_tls_io_result(Connection *conn, int rc, bool *saw_eof) {
+    if (rc > 0) {
+        clear_client_tls_block_state(conn);
+        return true;
+    }
+
+    const int ssl_error = SSL_get_error(conn->client_ssl, rc);
+    switch (ssl_error) {
+        case SSL_ERROR_WANT_READ:
+            conn->client_tls_want_read = true;
+            conn->client_tls_want_write = false;
+            return true;
+        case SSL_ERROR_WANT_WRITE:
+            conn->client_tls_want_read = false;
+            conn->client_tls_want_write = true;
+            return true;
+        case SSL_ERROR_ZERO_RETURN:
+            clear_client_tls_block_state(conn);
+            if (saw_eof != nullptr) {
+                *saw_eof = true;
+            }
+            return true;
+        default:
+            clear_client_tls_block_state(conn);
+            return false;
+    }
+}
+
+static bool tls_read_into_buffer(Connection *conn,
+                                 FixedBuffer<kHeaderBufferBytes> *buffer,
+                                 bool *saw_eof,
+                                 std::size_t *bytes_read_out) {
+    std::size_t total_read = 0;
+    for (;;) {
+        buffer->compact_if_needed();
+        if (unlikely(buffer->writable() == 0)) {
+            if (bytes_read_out != nullptr) {
+                *bytes_read_out += total_read;
+            }
+            return true;
+        }
+
+        size_t nread = 0;
+        const int rc = SSL_read_ex(conn->client_ssl, buffer->write_ptr(), buffer->writable(), &nread);
+        if (rc == 1) {
+            clear_client_tls_block_state(conn);
+            buffer->produced(nread);
+            total_read += nread;
+            continue;
+        }
+        if (!handle_client_tls_io_result(conn, rc, saw_eof)) {
+            return false;
+        }
+        if (bytes_read_out != nullptr) {
+            *bytes_read_out += total_read;
+        }
+        return true;
+    }
+}
+
+static bool tls_read_into_body_queue(Connection *conn,
+                                     WorkerRuntime *rt,
+                                     uint32_t &head,
+                                     uint32_t &tail,
+                                     uint32_t &count,
+                                     uint64_t max_bytes,
+                                     bool *saw_eof,
+                                     std::size_t *bytes_read_out) {
+    std::size_t total_read = 0;
+    while (max_bytes > 0 && count < kMaxBodyChunksPerConn) {
+        uint32_t chunk_index = tail;
+        if (chunk_index == Connection::kNoChunk || rt->body_chunks[chunk_index].end == kBodyChunkBytes) {
+            chunk_index = acquire_body_chunk(rt);
+            if (chunk_index == Connection::kNoChunk) {
+                break;
+            }
+            if (tail == Connection::kNoChunk) {
+                head = chunk_index;
+            } else {
+                rt->body_chunks[tail].next = chunk_index;
+            }
+            tail = chunk_index;
+            ++count;
+        }
+        WorkerRuntime::BodyChunk &chunk = rt->body_chunks[chunk_index];
+        const std::size_t writable = std::min<std::size_t>(kBodyChunkBytes - chunk.end, max_bytes);
+        if (writable == 0) {
+            break;
+        }
+
+        size_t nread = 0;
+        const int rc = SSL_read_ex(conn->client_ssl, chunk.data + chunk.end, writable, &nread);
+        if (rc == 1) {
+            clear_client_tls_block_state(conn);
+            chunk.end = static_cast<uint16_t>(chunk.end + nread);
+            total_read += nread;
+            max_bytes -= static_cast<uint64_t>(nread);
+            continue;
+        }
+        if (!handle_client_tls_io_result(conn, rc, saw_eof)) {
+            return false;
+        }
+        if (bytes_read_out != nullptr) {
+            *bytes_read_out += total_read;
+        }
+        return true;
+    }
+    if (bytes_read_out != nullptr) {
+        *bytes_read_out += total_read;
+    }
+    return true;
+}
+
+static bool tls_flush_client_output(Connection *conn,
+                                    WorkerRuntime *rt,
+                                    uint32_t &head,
+                                    uint32_t &tail,
+                                    uint32_t &count,
+                                    bool *blocked,
+                                    std::size_t *header_bytes_out,
+                                    std::size_t *body_bytes_out) {
+    while (!client_buffer(*conn).empty() || head != Connection::kNoChunk) {
+        const char *data = nullptr;
+        std::size_t len = 0;
+        const bool write_header = !client_buffer(*conn).empty();
+        if (write_header) {
+            data = client_buffer(*conn).read_ptr();
+            len = client_buffer(*conn).readable();
+        } else {
+            WorkerRuntime::BodyChunk &chunk = rt->body_chunks[head];
+            data = chunk.data + chunk.start;
+            len = static_cast<std::size_t>(chunk.end - chunk.start);
+        }
+
+        size_t nwritten = 0;
+        const int rc = SSL_write_ex(conn->client_ssl, data, len, &nwritten);
+        if (rc == 1) {
+            clear_client_tls_block_state(conn);
+            if (write_header) {
+                client_buffer(*conn).consumed(nwritten);
+                if (header_bytes_out != nullptr) {
+                    *header_bytes_out += nwritten;
+                }
+            } else {
+                WorkerRuntime::BodyChunk &chunk = rt->body_chunks[head];
+                chunk.start = static_cast<uint16_t>(chunk.start + nwritten);
+                if (body_bytes_out != nullptr) {
+                    *body_bytes_out += nwritten;
+                }
+                if (chunk.start == chunk.end) {
+                    const uint32_t next = chunk.next;
+                    release_body_chunk(rt, head);
+                    head = next;
+                    if (head == Connection::kNoChunk) {
+                        tail = Connection::kNoChunk;
+                    }
+                    if (count > 0) {
+                        --count;
+                    }
+                }
+            }
+            continue;
+        }
+        if (!handle_client_tls_io_result(conn, rc, nullptr)) {
+            return false;
+        }
+        if (blocked != nullptr) {
+            *blocked = true;
+        }
+        return true;
+    }
+    return true;
+}
+
 static bool read_into_buffer(int fd, FixedBuffer<kHeaderBufferBytes> *buffer, bool *saw_eof, std::size_t *bytes_read_out) {
     std::size_t total_read = 0;
     for (;;) {
@@ -1235,6 +1486,56 @@ static bool read_into_buffer(int fd, FixedBuffer<kHeaderBufferBytes> *buffer, bo
         }
         return false;
     }
+}
+
+static bool read_client_into_buffer(Connection *conn,
+                                    FixedBuffer<kHeaderBufferBytes> *buffer,
+                                    bool *saw_eof,
+                                    std::size_t *bytes_read_out) {
+    if (conn->client_tls_enabled && conn->client_tls_ready && conn->client_ssl != nullptr) {
+        return tls_read_into_buffer(conn, buffer, saw_eof, bytes_read_out);
+    }
+    return read_into_buffer(conn->client_fd, buffer, saw_eof, bytes_read_out);
+}
+
+static bool read_client_into_body_queue(Connection *conn,
+                                        WorkerRuntime *rt,
+                                        uint32_t &head,
+                                        uint32_t &tail,
+                                        uint32_t &count,
+                                        uint64_t max_bytes,
+                                        bool *saw_eof,
+                                        std::size_t *bytes_read_out) {
+    if (conn->client_tls_enabled && conn->client_tls_ready && conn->client_ssl != nullptr) {
+        return tls_read_into_body_queue(conn, rt, head, tail, count, max_bytes, saw_eof, bytes_read_out);
+    }
+    return read_into_body_queue(conn->client_fd, rt, head, tail, count, max_bytes, saw_eof, bytes_read_out);
+}
+
+static bool flush_client_output(Connection *conn,
+                                WorkerRuntime *rt,
+                                bool *blocked,
+                                std::size_t *header_bytes_out,
+                                std::size_t *body_bytes_out) {
+    if (conn->client_tls_enabled && conn->client_tls_ready && conn->client_ssl != nullptr) {
+        return tls_flush_client_output(conn,
+                                       rt,
+                                       conn->response_chunk_head,
+                                       conn->response_chunk_tail,
+                                       conn->response_chunk_count,
+                                       blocked,
+                                       header_bytes_out,
+                                       body_bytes_out);
+    }
+    return flush_buffer_and_body_queue(conn->client_fd,
+                                       &client_buffer(*conn),
+                                       rt,
+                                       conn->response_chunk_head,
+                                       conn->response_chunk_tail,
+                                       conn->response_chunk_count,
+                                       blocked,
+                                       header_bytes_out,
+                                       body_bytes_out);
 }
 
 static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
@@ -1304,9 +1605,33 @@ static bool open_upstream(WorkerRuntime *rt, Connection *conn) {
     return true;
 }
 
+static bool handle_client_tls_handshake(WorkerRuntime *rt, Connection *conn) {
+    if (!conn->client_tls_enabled || conn->client_ssl == nullptr) {
+        conn->state = ConnState::ReadClientHeaders;
+        return handle_client_header_read(rt, conn);
+    }
+
+    clear_client_tls_block_state(conn);
+    const int rc = SSL_accept(conn->client_ssl);
+    if (rc == 1) {
+        clear_client_tls_block_state(conn);
+        conn->client_tls_ready = true;
+        conn->state = ConnState::ReadClientHeaders;
+        mark_progress(conn, now_ms());
+        if (!refresh_client_interest(rt, conn)) {
+            return false;
+        }
+        return handle_client_header_read(rt, conn);
+    }
+    if (!handle_client_tls_io_result(conn, rc, &conn->saw_client_eof)) {
+        return false;
+    }
+    return refresh_client_interest(rt, conn);
+}
+
 static bool handle_client_header_read(WorkerRuntime *rt, Connection *conn) {
     std::size_t bytes_read = 0;
-    if (!read_into_buffer(conn->client_fd, &client_buffer(*conn), &conn->saw_client_eof, &bytes_read)) {
+    if (!read_client_into_buffer(conn, &client_buffer(*conn), &conn->saw_client_eof, &bytes_read)) {
         return false;
     }
     if (bytes_read > 0) {
@@ -1323,7 +1648,7 @@ static bool handle_client_header_read(WorkerRuntime *rt, Connection *conn) {
         if (conn->saw_client_eof) {
             return false;
         }
-        return true;
+        return refresh_client_interest(rt, conn);
     }
     if (status == ParseStatus::Error) {
         queue_error_response(conn,
@@ -1406,9 +1731,9 @@ static bool handle_upstream_write(WorkerRuntime *rt, Connection *conn) {
                conn->request_chunk_count < kMaxBodyChunksPerConn) {
             const uint64_t remain = conn->request_body_expected - conn->request_body_forwarded;
             std::size_t bytes_read = 0;
-            if (!read_into_body_queue(conn->client_fd, rt,
-                                      conn->request_chunk_head, conn->request_chunk_tail, conn->request_chunk_count,
-                                      remain, &conn->saw_client_eof, &bytes_read)) {
+            if (!read_client_into_body_queue(conn, rt,
+                                             conn->request_chunk_head, conn->request_chunk_tail, conn->request_chunk_count,
+                                             remain, &conn->saw_client_eof, &bytes_read)) {
                 queue_error_response(conn, 400, "client read failed", true);
                 return arm_error_response(rt, conn);
             }
@@ -1782,15 +2107,11 @@ static bool handle_client_write(WorkerRuntime *rt, Connection *conn) {
     bool blocked = false;
     std::size_t bytes_written = 0;
     std::size_t body_written = 0;
-    if (!flush_buffer_and_body_queue(conn->client_fd,
-                                     &client_buffer(*conn),
-                                     rt,
-                                     conn->response_chunk_head,
-                                     conn->response_chunk_tail,
-                                     conn->response_chunk_count,
-                                     &blocked,
-                                     &bytes_written,
-                                     &body_written)) {
+    if (!flush_client_output(conn,
+                             rt,
+                             &blocked,
+                             &bytes_written,
+                             &body_written)) {
         return false;
     }
     if (bytes_written > 0) {
@@ -1957,6 +2278,10 @@ static void cleanup_runtime(WorkerRuntime *rt) {
     if (rt->listener_fd >= 0) {
         close_fd(rt->listener_fd);
     }
+    if (rt->client_tls_ctx != nullptr) {
+        SSL_CTX_free(rt->client_tls_ctx);
+        rt->client_tls_ctx = nullptr;
+    }
 }
 
 } // namespace
@@ -2014,6 +2339,13 @@ bool ProxyEngine::Initialize(std::string *error_out) {
     runtime_->listener_fd = config_.listener_fd;
     runtime_->worker_index = config_.worker_index;
     runtime_->snapshot = config_.snapshot;
+    if (config_.tls.enabled) {
+        OPENSSL_init_ssl(0, nullptr);
+        runtime_->client_tls_ctx = SSL_CTX_new(TLS_server_method());
+        if (!configure_server_tls_context(runtime_->client_tls_ctx, config_.tls, error_out)) {
+            return false;
+        }
+    }
     if (!runtime_->discovery.Initialize(runtime_->snapshot, config_.discovery, error_out)) {
         return false;
     }
@@ -2118,6 +2450,20 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
                     runtime_->free_list.pop_back();
                     Connection &conn = runtime_->connections[idx];
                     conn.Reset(fd);
+                    if (runtime_->client_tls_ctx != nullptr) {
+                        conn.client_tls_enabled = true;
+                        conn.client_tls_ready = false;
+                        conn.client_tls_want_read = true;
+                        conn.client_tls_want_write = true;
+                        conn.state = ConnState::HandshakeClientTls;
+                        conn.client_ssl = SSL_new(runtime_->client_tls_ctx);
+                        if (conn.client_ssl == nullptr) {
+                            release_connection(runtime_.get(), &conn);
+                            continue;
+                        }
+                        SSL_set_fd(conn.client_ssl, conn.client_fd);
+                        SSL_set_accept_state(conn.client_ssl);
+                    }
                     conn.last_progress_ms = now;
                     ++runtime_->active_connections;
                     if (runtime_->active_connections > runtime_->peak_active_connections) {
@@ -2132,7 +2478,9 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
                     conn.client_registered = true;
                     conn.client_events = desired;
                     conn.client_token_generation = conn.generation;
-                    if (!handle_client_header_read(runtime_.get(), &conn)) {
+                    if ((conn.state == ConnState::HandshakeClientTls
+                             ? !handle_client_tls_handshake(runtime_.get(), &conn)
+                             : !handle_client_header_read(runtime_.get(), &conn))) {
                         release_connection(runtime_.get(), &conn);
                         continue;
                     }
@@ -2173,7 +2521,9 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
                     conn->saw_client_eof = true;
                     if (platform::HasEvent(event_mask, platform::kEventError) ||
                         platform::HasEvent(event_mask, platform::kEventHangup)) {
-                        if (conn->state != ConnState::ReadClientHeaders && conn->state != ConnState::WriteUpstream) {
+                        if (conn->state != ConnState::HandshakeClientTls &&
+                            conn->state != ConnState::ReadClientHeaders &&
+                            conn->state != ConnState::WriteUpstream) {
                             release_connection(runtime_.get(), conn);
                             continue;
                         }
@@ -2197,9 +2547,14 @@ int ProxyEngine::Run(volatile sig_atomic_t *stop_flag,
             bool ok = true;
             if (kind == CoreTag::Client) {
                 const bool client_progress = platform::HasEvent(event_mask, platform::kEventRead) ||
+                    platform::HasEvent(event_mask, platform::kEventWrite) ||
                     (conn->saw_client_eof &&
-                     (conn->state == ConnState::ReadClientHeaders || conn->state == ConnState::WriteUpstream));
-                if (conn->state == ConnState::ReadClientHeaders && client_progress) {
+                     (conn->state == ConnState::HandshakeClientTls ||
+                      conn->state == ConnState::ReadClientHeaders ||
+                      conn->state == ConnState::WriteUpstream));
+                if (conn->state == ConnState::HandshakeClientTls && client_progress) {
+                    ok = handle_client_tls_handshake(runtime_.get(), conn);
+                } else if (conn->state == ConnState::ReadClientHeaders && client_progress) {
                     ok = handle_client_header_read(runtime_.get(), conn);
                 } else if (conn->state == ConnState::WriteUpstream && client_progress) {
                     ok = handle_upstream_write(runtime_.get(), conn);

@@ -15,11 +15,21 @@ namespace kislay {
 namespace gateway {
 namespace core {
 
+struct TlsConfig {
+    bool enabled;
+    std::string cert_path;
+    std::string key_path;
+    std::string min_version;
+
+    TlsConfig() : enabled(false), min_version("tls1.2") {}
+};
+
 struct ProxyEngineConfig {
     int listener_fd;
     int worker_index;
     std::size_t max_body_bytes;
     std::size_t max_connections;
+    TlsConfig tls;
     DiscoveryConfig discovery;
     RouteSnapshot snapshot;
 

@@ -51,6 +51,11 @@ Connection::Connection()
       splice_eof(false),
       passthrough_response_headers(false),
       response_started(false),
+      client_tls_enabled(false),
+      client_tls_ready(false),
+      client_tls_want_read(false),
+      client_tls_want_write(false),
+      client_ssl(nullptr),
       request_chunk_head(Connection::kNoChunk),
       request_chunk_tail(Connection::kNoChunk),
       request_chunk_count(0),
@@ -113,6 +118,11 @@ void Connection::Reset(int fd) {
     splice_eof = false;
     passthrough_response_headers = false;
     response_started = false;
+    client_tls_enabled = false;
+    client_tls_ready = false;
+    client_tls_want_read = false;
+    client_tls_want_write = false;
+    client_ssl = nullptr;
     request_chunk_head = kNoChunk;
     request_chunk_tail = kNoChunk;
     request_chunk_count = 0;
@@ -138,6 +148,9 @@ void Connection::ResetForNextRequest() {
     const bool registered = client_registered;
     const uint32_t token_generation = client_token_generation;
     const uint64_t last_progress = last_progress_ms;
+    const bool client_tls_enabled_value = client_tls_enabled;
+    const bool client_tls_ready_value = client_tls_ready;
+    const SSL *client_ssl_value = client_ssl;
     Reset(fd);
     client_events = events;
     client_registered = registered;
@@ -145,6 +158,9 @@ void Connection::ResetForNextRequest() {
     in_use = fd >= 0;
     keep_alive_idle = true;
     last_progress_ms = last_progress;
+    client_tls_enabled = client_tls_enabled_value;
+    client_tls_ready = client_tls_ready_value;
+    client_ssl = const_cast<SSL *>(client_ssl_value);
 }
 
 } // namespace core

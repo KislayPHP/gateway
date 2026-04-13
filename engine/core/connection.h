@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstring>
 
+typedef struct ssl_st SSL;
+
 namespace kislay {
 namespace gateway {
 namespace core {
@@ -15,7 +17,8 @@ static constexpr std::size_t kHeaderBufferBytes = 8192;
 static constexpr std::size_t kMaxHeaderRefs = 64;
 
 enum class ConnState {
-    ReadClientHeaders = 0,
+    HandshakeClientTls = 0,
+    ReadClientHeaders,
     ReadClientBody,
     ResolveRoute,
     ConnectUpstream,
@@ -90,6 +93,11 @@ struct Connection {
     bool splice_eof;
     bool passthrough_response_headers;
     bool response_started;
+    bool client_tls_enabled;
+    bool client_tls_ready;
+    bool client_tls_want_read;
+    bool client_tls_want_write;
+    SSL *client_ssl;
     uint32_t request_chunk_head;
     uint32_t request_chunk_tail;
     uint32_t request_chunk_count;
