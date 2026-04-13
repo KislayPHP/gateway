@@ -838,6 +838,14 @@ static bool read_into_body_queue(int fd,
     return true;
 }
 
+static void shutdown_client_tls(Connection *conn) {
+    if (conn == nullptr || conn->client_ssl == nullptr || !conn->client_tls_ready) {
+        return;
+    }
+    SSL_set_shutdown(conn->client_ssl, SSL_get_shutdown(conn->client_ssl) | SSL_RECEIVED_SHUTDOWN);
+    (void) SSL_shutdown(conn->client_ssl);
+}
+
 static void release_connection(WorkerRuntime *rt, Connection *conn) {
     assert(conn != nullptr);
     if (!conn->in_use && conn->client_fd < 0 && conn->upstream_fd < 0) {
@@ -861,6 +869,7 @@ static void release_connection(WorkerRuntime *rt, Connection *conn) {
             conn->client_token_generation = 0;
         }
         if (conn->client_ssl != nullptr) {
+            shutdown_client_tls(conn);
             SSL_free(conn->client_ssl);
             conn->client_ssl = nullptr;
         }
