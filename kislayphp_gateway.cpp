@@ -81,6 +81,7 @@ typedef struct _php_kislayphp_gateway_t {
     std::vector<std::string> auth_exclude_prefixes;
     std::string jwt_secret;
     std::string auth_user_header;
+    bool trace_enabled;
     bool rate_limit_enabled;
     zend_long rate_limit_requests;
     zend_long rate_limit_window_seconds;
@@ -284,6 +285,11 @@ static const char *kislayphp_get_header(const struct mg_request_info *info, cons
     return nullptr;
 }
 
+static bool kislayphp_request_wants_close(const struct mg_request_info *info) {
+    const char *connection = kislayphp_get_header(info, "Connection");
+    return connection != nullptr && ::strcasecmp(connection, "close") == 0;
+}
+
 static bool kislayphp_has_prefix(const std::string &value, const std::string &prefix) {
     if (prefix.empty()) {
         return false;
@@ -349,6 +355,7 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
         kislayphp_env_string("KISLAY_GATEWAY_AUTH_EXCLUDE", "/health,/ready,/metrics"));
     obj->jwt_secret = kislayphp_env_string("KISLAY_GATEWAY_JWT_SECRET", "");
     obj->auth_user_header = "X-Authenticated-User";
+    obj->trace_enabled = kislayphp_env_bool("KISLAY_GATEWAY_TRACE_ENABLED", false);
     obj->rate_limit_enabled = kislayphp_env_bool("KISLAY_GATEWAY_RATE_LIMIT_ENABLED", false);
     obj->rate_limit_requests = kislayphp_env_long("KISLAY_GATEWAY_RATE_LIMIT_REQUESTS", 120);
     if (obj->rate_limit_requests < 1) {
@@ -1010,9 +1017,14 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         }
         if (!resp_has_length && resp_info->content_length >= 0) {
             mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
+            resp_has_length = true;
         }
     }
-    mg_printf(conn, "Connection: close\r\n\r\n");
+    const bool downstream_keep_alive =
+        !kislayphp_request_wants_close(info) &&
+        resp_has_length &&
+        status_code != 101;
+    mg_printf(conn, "Connection: %s\r\n\r\n", downstream_keep_alive ? "keep-alive" : "close");
 
     char buffer[16384];
     int read_len = 0;
@@ -1160,7 +1172,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         const char *ts_hdr = kislayphp_get_header(info, "tracestate");
         if (tp_hdr) {
             extra_proxy_headers.emplace_back("traceparent", std::string(tp_hdr));
-        } else {
+        } else if (gateway->trace_enabled) {
             // No incoming traceparent — generate one so downstream services have trace context
             std::string trace_id = kislay_gw_random_hex(16);
             std::string span_id  = kislay_gw_random_hex(8);
@@ -1589,6 +1601,10 @@ PHP_METHOD(KislayPHPGateway, listen) {
     std::string threads_value = std::to_string(obj->thread_count);
     options.push_back("num_threads");
     options.push_back(threads_value.c_str());
+    options.push_back("enable_keep_alive");
+    options.push_back("yes");
+    options.push_back("keep_alive_timeout_ms");
+    options.push_back("30000");
     options.push_back(nullptr);
 
     struct mg_callbacks callbacks;

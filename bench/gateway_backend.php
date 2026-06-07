@@ -22,6 +22,11 @@ $port = (int)(getenv('BACKEND_PORT') ?: 9292);
 
 $app = new Kislay\Core\App();
 $app->setOption('log', false);
+$app->setOption('num_threads', max(1, (int)(getenv('BACKEND_HTTP_THREADS') ?: 8)));
+$workers = max(1, (int)(getenv('BACKEND_WORKERS') ?: 10));
+if ($workers > 1) {
+    $app->setOption('workers', $workers);
+}
 
 // ── Baseline ──────────────────────────────────────────────────────────────────
 $app->get('/health', function ($req, $res) {

@@ -17,6 +17,7 @@
  *   GW_HOST          — listen host   (default: 127.0.0.1)
  *   GW_PORT          — listen port   (default: 9380)
  *   BACKEND_URL      — upstream base (default: http://127.0.0.1:9292)
+ *   BACKEND_URLS     — comma-separated upstream pool for load-balancer routes
  *   KISLAY_GATEWAY_* — all gateway env vars are passed through to the extension
  */
 
@@ -28,6 +29,11 @@ if (!extension_loaded('kislayphp_gateway')) {
 $gwHost     = getenv('GW_HOST')     ?: '127.0.0.1';
 $gwPort     = (int)(getenv('GW_PORT') ?: 9380);
 $backendUrl = getenv('BACKEND_URL') ?: 'http://127.0.0.1:9292';
+$backendUrlsRaw = getenv('BACKEND_URLS') ?: $backendUrl;
+$backendUrls = array_values(array_filter(array_map('trim', explode(',', $backendUrlsRaw))));
+if (!$backendUrls) {
+    $backendUrls = [$backendUrl];
+}
 
 $gw = new Kislay\Gateway\Gateway();
 
@@ -59,6 +65,7 @@ $gw->requireAuth($jwtSecret, [
     'exclude' => [
         '/health',
         '/proxy/',          // all /proxy/* routes are public for baseline comparison
+        '/lb/',             // load-balancer benchmark routes are public baseline paths
         '/no-auth',
     ],
 ]);
@@ -68,10 +75,7 @@ $gw->addRoute('GET', '/secure/headers', $backendUrl);
 // ── Native service registry (round-robin load balancing) ─────────────────────
 $gw->addServiceRoute('GET', '/lb/json',      'backend-pool');
 $gw->addServiceRoute('GET', '/lb/plaintext', 'backend-pool');
-$gw->registerService('backend-pool', [
-    $backendUrl,
-    $backendUrl,    // same target twice — simulates a 2-node pool on localhost
-]);
+$gw->registerService('backend-pool', $backendUrls);
 
 // ── Fallback route ────────────────────────────────────────────────────────────
 $gw->setFallbackTarget($backendUrl);
@@ -79,6 +83,7 @@ $gw->setFallbackTarget($backendUrl);
 // ── Start ─────────────────────────────────────────────────────────────────────
 fwrite(STDOUT, "[gateway] Listening on http://{$gwHost}:{$gwPort}\n");
 fwrite(STDOUT, "[gateway] Backend: {$backendUrl}\n");
+fwrite(STDOUT, "[gateway] Backend pool: " . implode(', ', $backendUrls) . "\n");
 fwrite(STDOUT, "[gateway] Threads: {$threads}\n");
 
 $gw->listen($gwHost, $gwPort);

@@ -26,6 +26,7 @@ RESULTS_DIR="${BENCH_DIR}/results"
 mkdir -p "$RESULTS_DIR"
 
 BACKEND_PORT="${BACKEND_PORT:-9292}"
+LB_BACKENDS="${LB_BACKENDS:-4}"
 GW_PORT="${GW_PORT:-9380}"
 GW_RL_PORT="${GW_RL_PORT:-9381}"
 HOST="127.0.0.1"
@@ -65,12 +66,20 @@ JWT_TOKEN="${JWT_HEADER}.${JWT_PAYLOAD}.${JWT_SIG}"
 
 # ── Process management ─────────────────────────────────────────────────────────
 BACKEND_PID=""
+BACKEND_URLS=""
 GW_PID=""
 GW_RL_PID=""
 
 cleanup() {
     for pid in $BACKEND_PID $GW_PID $GW_RL_PID; do
+        [[ -n "$pid" ]] && pkill -TERM -P "$pid" 2>/dev/null || true
+    done
+    for pid in $BACKEND_PID $GW_PID $GW_RL_PID; do
         [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+    for pid in $BACKEND_PID $GW_PID $GW_RL_PID; do
+        [[ -n "$pid" ]] && pkill -KILL -P "$pid" 2>/dev/null || true
     done
     for pid in $BACKEND_PID $GW_PID $GW_RL_PID; do
         [[ -n "$pid" ]] && wait "$pid" 2>/dev/null || true
@@ -91,16 +100,29 @@ wait_for() {
     return 1
 }
 
-# ── Start backend ──────────────────────────────────────────────────────────────
-echo "[bench] Starting backend on port $BACKEND_PORT..."
-BACKEND_PORT=$BACKEND_PORT \
-php -d extension="$CORE_EXT" "$BENCH_DIR/gateway_backend.php" >/tmp/gw_backend.log 2>&1 &
-BACKEND_PID=$!
+# ── Start backend pool ─────────────────────────────────────────────────────────
+echo "[bench] Starting $LB_BACKENDS backend instance(s) from port $BACKEND_PORT..."
+for i in $(seq 0 $((LB_BACKENDS - 1))); do
+    port=$((BACKEND_PORT + i))
+    BACKEND_PORT=$port \
+    BACKEND_HTTP_THREADS="${BACKEND_HTTP_THREADS:-8}" \
+    BACKEND_WORKERS="${BACKEND_WORKERS:-10}" \
+    php -d extension="$CORE_EXT" "$BENCH_DIR/gateway_backend.php" >/tmp/gw_backend_${port}.log 2>&1 &
+    pid=$!
+    BACKEND_PID="${BACKEND_PID} ${pid}"
+    url="http://$HOST:$port"
+    if [[ -z "$BACKEND_URLS" ]]; then
+        BACKEND_URLS="$url"
+    else
+        BACKEND_URLS="${BACKEND_URLS},${url}"
+    fi
+done
 
 # ── Start main gateway ─────────────────────────────────────────────────────────
 echo "[bench] Starting gateway on port $GW_PORT..."
 GW_PORT=$GW_PORT \
 BACKEND_URL="http://$HOST:$BACKEND_PORT" \
+BACKEND_URLS="$BACKEND_URLS" \
 KISLAY_GATEWAY_THREADS=8 \
 php -d extension="$GW_EXT" "$BENCH_DIR/gateway_server.php" >/tmp/gw_server.log 2>&1 &
 GW_PID=$!
@@ -110,6 +132,7 @@ if [[ "${SKIP_RATE_LIMIT:-0}" != "1" ]]; then
     echo "[bench] Starting rate-limited gateway on port $GW_RL_PORT..."
     GW_PORT=$GW_RL_PORT \
     BACKEND_URL="http://$HOST:$BACKEND_PORT" \
+    BACKEND_URLS="$BACKEND_URLS" \
     KISLAY_GATEWAY_RATE_LIMIT_ENABLED=1 \
     KISLAY_GATEWAY_RATE_LIMIT_REQUESTS=20 \
     KISLAY_GATEWAY_RATE_LIMIT_WINDOW=1 \
@@ -119,7 +142,10 @@ if [[ "${SKIP_RATE_LIMIT:-0}" != "1" ]]; then
 fi
 
 # ── Wait for readiness ─────────────────────────────────────────────────────────
-wait_for "http://$HOST:$BACKEND_PORT/health" "Backend"
+for i in $(seq 0 $((LB_BACKENDS - 1))); do
+    port=$((BACKEND_PORT + i))
+    wait_for "http://$HOST:$port/health" "Backend:$port"
+done
 wait_for "http://$HOST:$GW_PORT/health" "Gateway"
 if [[ -n "${GW_RL_PID}" ]]; then
     wait_for "http://$HOST:$GW_RL_PORT/health" "Rate-limited gateway" || true
@@ -176,6 +202,7 @@ echo "════════════════════════�
 echo " KislayPHP Gateway — Performance Benchmark (Go-bench level rigor)"
 echo "════════════════════════════════════════════════════════════════════════════════"
 printf " Backend  : %s\n" "$BACKEND_BASE"
+printf " Pool     : %s\n" "$BACKEND_URLS"
 printf " Gateway  : %s\n" "$GW_BASE"
 printf " wrk      : %d threads, %d connections, %ds per scenario\n" "$THREADS" "$CONNS" "$DURATION"
 echo "════════════════════════════════════════════════════════════════════════════════"
@@ -202,7 +229,7 @@ get_result() {
 capture_rps() {
     local key="$1" url="$2"; shift 2
     local out
-    out=$(wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$@" "$url" 2>&1)
+    out=$(wrk -t"$THREADS" -c"$CONNS" -d"${DURATION}s" --latency "$@" "$url" 2>&1 || true)
     set_result "RPS" "$key" "$(echo "$out" | awk '/Requests\/sec:/{print $2; found=1} END{if (!found) print "N/A"}')"
     set_result "P99" "$key" "$(echo "$out" | awk '/99%/{print $2; found=1; exit} END{if (!found) print "N/A"}')"
     echo "$out" | awk '/Latency|Req\/Sec|requests in|Transfer\/sec|50%|75%|90%|99%/{print "  " $0}'
