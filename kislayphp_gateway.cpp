@@ -91,6 +91,12 @@ typedef struct _php_kislayphp_gateway_t {
     zend_long circuit_failure_threshold;
     zend_long circuit_open_seconds;
     std::unordered_map<std::string, kislayphp_circuit_state> circuit_states;
+    // Frozen route table: built once at listen() time for lock-free O(1) hot-path lookup.
+    // frozen_exact: (method + '\0' + path) → route for exact paths.
+    // frozen_prefix: wildcard routes (path ends in '*'), sorted longest prefix first.
+    std::atomic<bool> route_table_frozen;
+    std::unordered_map<std::string, kislayphp_gateway_route> frozen_exact;
+    std::vector<kislayphp_gateway_route> frozen_prefix;
     zend_object std;
 } php_kislayphp_gateway_t;
 
@@ -336,6 +342,9 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->auth_user_header) std::string();
     new (&obj->rate_limits) std::unordered_map<std::string, kislayphp_rate_limit_entry>();
     new (&obj->circuit_states) std::unordered_map<std::string, kislayphp_circuit_state>();
+    new (&obj->route_table_frozen) std::atomic<bool>(false);
+    new (&obj->frozen_exact) std::unordered_map<std::string, kislayphp_gateway_route>();
+    new (&obj->frozen_prefix) std::vector<kislayphp_gateway_route>();
     obj->ctx = nullptr;
     obj->running = false;
     obj->has_fallback = false;
@@ -394,6 +403,9 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
     obj->jwt_secret.~basic_string();
     obj->auth_exclude_prefixes.~vector();
     obj->auth_bearer_token.~basic_string();
+    obj->frozen_prefix.~vector();
+    obj->frozen_exact.~unordered_map();
+    obj->route_table_frozen.~atomic<bool>();
     obj->routes.~vector();
     obj->fallback_route.~kislayphp_gateway_route();
     obj->lock.~mutex();
@@ -1079,6 +1091,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     // Auth check: JWT (HS256) when jwt_secret is set; legacy bearer token otherwise.
     // Validated sub/roles are forwarded as upstream headers via extra_proxy_headers.
     std::vector<std::pair<std::string,std::string>> extra_proxy_headers;
+    extra_proxy_headers.reserve(4);
 
     if (gateway->auth_required) {
         if (!kislay_gateway_path_excluded(path, gateway->auth_exclude_prefixes)) {
@@ -1186,7 +1199,32 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
 
     kislayphp_gateway_route match;
     bool found = false;
-    {
+    if (gateway->route_table_frozen.load(std::memory_order_acquire)) {
+        // Lock-free hot path: O(1) hash lookup, then short prefix scan.
+        std::string key;
+        key.reserve(method.size() + 1 + path.size());
+        key = method;
+        key += '\0';
+        key += path;
+        auto it = gateway->frozen_exact.find(key);
+        if (it != gateway->frozen_exact.end()) {
+            match = it->second;
+            found = true;
+        } else {
+            for (const auto &r : gateway->frozen_prefix) {
+                if ((r.method == method || r.method == "*") && kislayphp_path_matches(r.path, path)) {
+                    match = r;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found && gateway->has_fallback) {
+            match = gateway->fallback_route;
+            found = true;
+        }
+    } else {
+        // Slow path: locked linear scan (only reachable before listen() returns).
         std::lock_guard<std::mutex> guard(gateway->lock);
         for (const auto &route : gateway->routes) {
             if (route.method == method && kislayphp_path_matches(route.path, path)) {
@@ -1606,6 +1644,30 @@ PHP_METHOD(KislayPHPGateway, listen) {
     options.push_back("keep_alive_timeout_ms");
     options.push_back("30000");
     options.push_back(nullptr);
+
+    // Build frozen route table before starting threads so all reads are lock-free.
+    // Exact paths go into an unordered_map (O(1)); wildcard paths (*) go into a
+    // vector sorted longest-prefix-first so the most specific pattern wins.
+    {
+        obj->frozen_exact.reserve(obj->routes.size());
+        for (const auto &r : obj->routes) {
+            if (!r.path.empty() && r.path.back() == '*') {
+                obj->frozen_prefix.push_back(r);
+            } else {
+                std::string key;
+                key.reserve(r.method.size() + 1 + r.path.size());
+                key = r.method;
+                key += '\0';
+                key += r.path;
+                obj->frozen_exact.emplace(std::move(key), r);
+            }
+        }
+        std::sort(obj->frozen_prefix.begin(), obj->frozen_prefix.end(),
+            [](const kislayphp_gateway_route &a, const kislayphp_gateway_route &b) {
+                return a.path.size() > b.path.size();
+            });
+        obj->route_table_frozen.store(true, std::memory_order_release);
+    }
 
     struct mg_callbacks callbacks;
     std::memset(&callbacks, 0, sizeof(callbacks));
