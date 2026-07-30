@@ -4,18 +4,27 @@
 
 [![PHP Version](https://img.shields.io/badge/PHP-8.2+-blue.svg)](https://php.net)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![Release](https://img.shields.io/badge/Release-1.0.0-orange.svg)]()
 
 ## Installation
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/gateway:0.0.9
+pie install kislayphp/gateway:1.0.0
 ```
 
 Add to `php.ini`:
 ```ini
 extension=kislayphp_gateway.so
 ```
+
+## New in 1.0.0
+
+- **Fixed a crash bug**: concurrent requests through service-registry/native-service routes could abort the whole process (Zend memory-manager corruption from calling PHP error-reporting APIs on a raw worker thread). Warning logging now goes straight to stderr instead.
+- **Fixed a Host-header bug**: `registerService()` and `setFallbackTarget()` routes sent a blank `Host:` header upstream and never reused pooled connections — both now correctly compute their routing keys at registration time.
+- Hot-path allocation reductions across the proxy request path (thread-local buffers for headers, method casing, and route lookups; a fast path for the common no-rewrite route case).
+- In cross-language benchmarks, KislayPHP Gateway now beats Go's `httputil.ReverseProxy`, Node.js, and Spring Cloud Gateway on both throughput and tail latency for plain-proxy and JWT scenarios.
+- **Known issue**: genuine multi-host round-robin (multiple distinct backends behind one `registerService()` pool) still collapses under real concurrency — not yet fixed, needs interactive debugger-level investigation. Single-backend service routes and static routes are unaffected.
 
 ## Role In The Stack
 
