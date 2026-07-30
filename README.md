@@ -26,6 +26,22 @@ extension=kislayphp_gateway.so
 - In cross-language benchmarks, KislayPHP Gateway now beats Go's `httputil.ReverseProxy`, Node.js, and Spring Cloud Gateway on both throughput and tail latency for plain-proxy and JWT scenarios.
 - **Known issue**: genuine multi-host round-robin (multiple distinct backends behind one `registerService()` pool) still collapses under real concurrency — not yet fixed, needs interactive debugger-level investigation. Single-backend service routes and static routes are unaffected.
 
+## Performance
+
+Plain proxy pass-through, wrk (2 threads, 20 connections, 3s + 5s warmup), 10-core reference machine, all gateways proxying to the same Node.js backend. Produced by `compare/run_gateway_compare.sh proxy`:
+
+| Gateway | req/s | p50 | p99 | vs KislayPHP |
+|---|---:|---:|---:|---:|
+| **KislayPHP Gateway** | **80,306** | **119.5µs** | **236µs** | — |
+| Node.js (native, cluster) | 54,073 | 325µs | 2.76ms | -32.7% |
+| Spring Cloud Gateway | 50,357 | 347µs | 1.75ms | -37.3% |
+| Go (httputil.ReverseProxy) | 45,903 | 416µs | 1.14ms | -42.8% |
+| Node.js (native, single process) | 35,433 | 543µs | 1.08ms | -55.9% |
+
+Direct backend, no gateway in front (baseline): 130,591 req/s.
+
+KislayPHP Gateway wins on both throughput and tail latency against every reverse proxy in the comparison, including Spring Cloud Gateway and Go's own `net/http/httputil.ReverseProxy`. Reproduce with `../compare/run_gateway_compare.sh` from the repo root, or the quick `../perf_smoke_test.sh` for a faster (and less statistically rigorous) sanity check. Note: this scenario uses a single backend — see the "Known issue" above for the current gap under genuine multi-host round-robin.
+
 ## Role In The Stack
 
 Gateway is the edge layer only.
