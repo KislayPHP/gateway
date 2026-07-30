@@ -13,11 +13,14 @@ extern "C" {
 #include <civetweb.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <memory>
+#include <array>
 #include <mutex>
+#include <shared_mutex>
 #include <strings.h>
 #include <string>
 #include <unordered_map>
@@ -44,6 +47,8 @@ struct kislayphp_gateway_route {
     int port;
     bool use_tls;
     std::string base_path;
+    std::string upstream_key;  // pre-computed "host:port" to avoid per-request alloc
+    std::string pool_key;      // pre-computed "host:port" or "host:ports" for TLS
 };
 
 struct kislayphp_rate_limit_entry {
@@ -51,9 +56,35 @@ struct kislayphp_rate_limit_entry {
     zend_long count;
 };
 
-struct kislayphp_circuit_state {
-    zend_long failures;
-    int64_t open_until_ms;  // milliseconds from steady_clock epoch
+// Per-host circuit breaker state. Failures and open_until_ms are atomics so the
+// hot-path check and update need no global lock — only the map insertion (first-seen
+// host) takes an exclusive lock on circuit_map_rwlock.
+struct PerHostCircuitState {
+    std::atomic<zend_long> failures{0};
+    std::atomic<int64_t>   open_until_ms{0};
+};
+
+// 64-bit FNV-1a hash — fast, no heap allocation, feeds directly from two string_views.
+// Used to turn "client_id + method" into a single uint64_t map key, avoiding the
+// per-request string construction that std::hash<string> would require.
+static inline uint64_t kislayphp_rl_hash(const char *ip, size_t ip_len,
+                                          const char *method, size_t method_len) noexcept {
+    constexpr uint64_t FNV_OFFSET = 14695981039346656037ULL;
+    constexpr uint64_t FNV_PRIME  = 1099511628211ULL;
+    uint64_t h = FNV_OFFSET;
+    for (size_t i = 0; i < ip_len;     ++i) { h ^= static_cast<uint8_t>(ip[i]);     h *= FNV_PRIME; }
+    h ^= static_cast<uint8_t>('|'); h *= FNV_PRIME;
+    for (size_t i = 0; i < method_len; ++i) { h ^= static_cast<uint8_t>(method[i]); h *= FNV_PRIME; }
+    return h;
+}
+
+// 64-shard rate-limit table. Each shard has its own mutex so concurrent requests
+// from different IPs (hashing to different shards) never contend.
+// Keys are uint64_t FNV-1a hashes of (client_ip + method) — no heap allocation per request.
+static constexpr size_t RATE_LIMIT_SHARDS = 64;
+struct RateLimitShard {
+    alignas(64) std::mutex lock;
+    std::unordered_map<uint64_t, kislayphp_rate_limit_entry> entries;
 };
 
 struct kislayphp_native_service_entry {
@@ -85,12 +116,13 @@ typedef struct _php_kislayphp_gateway_t {
     bool rate_limit_enabled;
     zend_long rate_limit_requests;
     zend_long rate_limit_window_seconds;
-    std::unordered_map<std::string, kislayphp_rate_limit_entry> rate_limits;
+    std::array<RateLimitShard, RATE_LIMIT_SHARDS> rate_limit_shards;
     std::atomic<uint64_t> rate_limit_request_counter{0};
     bool circuit_breaker_enabled;
     zend_long circuit_failure_threshold;
     zend_long circuit_open_seconds;
-    std::unordered_map<std::string, kislayphp_circuit_state> circuit_states;
+    std::unordered_map<std::string, std::shared_ptr<PerHostCircuitState>> circuit_states;
+    std::shared_mutex circuit_map_lock;
     // Frozen route table: built once at listen() time for lock-free O(1) hot-path lookup.
     // frozen_exact: (method + '\0' + path) → route for exact paths.
     // frozen_prefix: wildcard routes (path ends in '*'), sorted longest prefix first.
@@ -111,31 +143,38 @@ static zend_long kislayphp_env_long(const char *name, zend_long fallback) {
 }
 
 static bool kislayphp_is_hop_header(const char *name) {
-    if (name == nullptr) {
-        return false;
+    if (name == nullptr || name[0] == '\0') return false;
+    // Dispatch on lowercased first char — most non-hop headers fail here with
+    // zero strcasecmp calls instead of up to seven.
+    switch (name[0] | 0x20) {
+    case 'c': return ::strcasecmp(name, "Connection") == 0;
+    case 'p': return ::strcasecmp(name, "Proxy-Connection") == 0;
+    case 'k': return ::strcasecmp(name, "Keep-Alive") == 0;
+    case 't': return ::strcasecmp(name, "TE") == 0 ||
+                     ::strcasecmp(name, "Trailer") == 0 ||
+                     ::strcasecmp(name, "Transfer-Encoding") == 0;
+    case 'u': return ::strcasecmp(name, "Upgrade") == 0;
+    default:  return false;
     }
-    if (::strcasecmp(name, "Connection") == 0) {
-        return true;
+}
+
+// True for headers that must be stripped before forwarding upstream:
+// Host, X-Forwarded-*, plus all hop-by-hop headers.  Single switch on the
+// lowercased first character keeps the hot path to at most one strcasecmp.
+static bool kislayphp_skip_upstream_header(const char *name) {
+    if (name == nullptr || name[0] == '\0') return false;
+    switch (name[0] | 0x20) {
+    case 'h': return ::strcasecmp(name, "Host") == 0;
+    case 'x': return ::strncasecmp(name, "X-Forwarded-", 12) == 0;
+    case 'c': return ::strcasecmp(name, "Connection") == 0;
+    case 'p': return ::strcasecmp(name, "Proxy-Connection") == 0;
+    case 'k': return ::strcasecmp(name, "Keep-Alive") == 0;
+    case 't': return ::strcasecmp(name, "TE") == 0 ||
+                     ::strcasecmp(name, "Trailer") == 0 ||
+                     ::strcasecmp(name, "Transfer-Encoding") == 0;
+    case 'u': return ::strcasecmp(name, "Upgrade") == 0;
+    default:  return false;
     }
-    if (::strcasecmp(name, "Proxy-Connection") == 0) {
-        return true;
-    }
-    if (::strcasecmp(name, "Keep-Alive") == 0) {
-        return true;
-    }
-    if (::strcasecmp(name, "TE") == 0) {
-        return true;
-    }
-    if (::strcasecmp(name, "Trailer") == 0) {
-        return true;
-    }
-    if (::strcasecmp(name, "Transfer-Encoding") == 0) {
-        return true;
-    }
-    if (::strcasecmp(name, "Upgrade") == 0) {
-        return true;
-    }
-    return false;
 }
 
 static bool kislayphp_env_bool(const char *name, bool fallback) {
@@ -340,8 +379,9 @@ static zend_object *kislayphp_gateway_create_object(zend_class_entry *ce) {
     new (&obj->auth_exclude_prefixes) std::vector<std::string>();
     new (&obj->jwt_secret) std::string();
     new (&obj->auth_user_header) std::string();
-    new (&obj->rate_limits) std::unordered_map<std::string, kislayphp_rate_limit_entry>();
-    new (&obj->circuit_states) std::unordered_map<std::string, kislayphp_circuit_state>();
+    new (&obj->rate_limit_shards) std::array<RateLimitShard, RATE_LIMIT_SHARDS>();
+    new (&obj->circuit_states) std::unordered_map<std::string, std::shared_ptr<PerHostCircuitState>>();
+    new (&obj->circuit_map_lock) std::shared_mutex();
     new (&obj->route_table_frozen) std::atomic<bool>(false);
     new (&obj->frozen_exact) std::unordered_map<std::string, kislayphp_gateway_route>();
     new (&obj->frozen_prefix) std::vector<kislayphp_gateway_route>();
@@ -397,8 +437,10 @@ static void kislayphp_gateway_free_obj(zend_object *object) {
         zval_ptr_dtor(&obj->resolver);
     }
     obj->native_services.~shared_ptr();
+    obj->circuit_map_lock.~shared_mutex();
     obj->circuit_states.~unordered_map();
-    obj->rate_limits.~unordered_map();
+    using RLShardsArray = std::array<RateLimitShard, RATE_LIMIT_SHARDS>;
+    obj->rate_limit_shards.~RLShardsArray();
     obj->auth_user_header.~basic_string();
     obj->jwt_secret.~basic_string();
     obj->auth_exclude_prefixes.~vector();
@@ -420,6 +462,17 @@ static std::string kislayphp_to_upper(const std::string &value) {
     return out;
 }
 
+// Hot-path variant: real HTTP clients almost always send an already-uppercase
+// verb (GET/POST/...), so mutate in place instead of allocating+copying via
+// kislayphp_to_upper on every single request.
+static void kislayphp_uppercase_inplace(std::string &value) {
+    for (char &c : value) {
+        if (c >= 'a' && c <= 'z') {
+            c = static_cast<char>(c - ('a' - 'A'));
+        }
+    }
+}
+
 static std::string kislayphp_exception_debug_string() {
     if (EG(exception) == nullptr) {
         return "";
@@ -438,6 +491,12 @@ static std::string kislayphp_exception_debug_string() {
 }
 
 static std::string kislayphp_join_paths(const std::string &base, const std::string &path) {
+    // Fast path: base_path=="/" (the overwhelming majority of routes, since no
+    // sub-path rewriting is configured) means the joined path is always just
+    // `path` unchanged — skip the substr()+concatenation below entirely.
+    if (base.size() == 1 && base[0] == '/') {
+        return path;
+    }
     if (base.empty()) {
         return path.empty() ? std::string("/") : path;
     }
@@ -519,6 +578,18 @@ static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_
     route.use_tls = use_tls;
     route.base_path = base_path;
     return true;
+}
+
+// Pre-computes "host:port" (upstream_key, used for the Host header and
+// circuit-breaker keying) and "host:port[s]" (pool_key, used for connection
+// pooling) once, at route-registration time, so the request hot path never
+// has to allocate/concatenate these strings. Must be called for every route
+// that resolves to a concrete host:port (static addRoute targets, each
+// registerService() pool member, and setFallbackTarget()) — dynamic
+// use_service routes resolve their backend per-request and don't need this.
+static void kislayphp_compute_route_keys(kislayphp_gateway_route &route) {
+    route.upstream_key = route.host + ":" + std::to_string(route.port);
+    route.pool_key = route.upstream_key + (route.use_tls ? "s" : "");
 }
 
 static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval, std::string *error_out = nullptr) {
@@ -790,9 +861,8 @@ public:
         clear();
     }
 
-    struct mg_connection* acquire(const std::string& host, int port, bool use_tls) {
-        std::string key = host + ":" + std::to_string(port) + (use_tls ? "s" : "");
-        auto it = pool.find(key);
+    struct mg_connection* acquire(const std::string& pool_key) {
+        auto it = pool.find(pool_key);
         if (it != pool.end() && !it->second.empty()) {
             auto& conns = it->second;
             while (!conns.empty()) {
@@ -817,11 +887,9 @@ public:
         return nullptr;
     }
 
-    void release(struct mg_connection* conn, const std::string& host, int port, bool use_tls) {
+    void release(struct mg_connection* conn, const std::string& pool_key) {
         if (!conn) return;
-        
-        std::string key = host + ":" + std::to_string(port) + (use_tls ? "s" : "");
-        
+
         // Enforce total limit: 128 connections per thread
         if (total_connections >= 128) {
             // Find oldest connection across all hosts
@@ -846,15 +914,15 @@ public:
             }
         }
 
-        auto& conns = pool[key];
+        auto& conns = pool[pool_key];
         if (conns.size() >= 16) { // Max 16 connections per host per thread
             auto old_pconn = std::move(conns.front());
             conns.erase(conns.begin());
             mg_close_connection(old_pconn.conn);
             total_connections--;
         }
-        
-        conns.push_back({conn, std::chrono::steady_clock::now(), key});
+
+        conns.push_back({conn, std::chrono::steady_clock::now(), pool_key});
         total_connections++;
     }
 
@@ -878,7 +946,9 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
                                     const kislayphp_gateway_route &route,
                                     size_t max_body_bytes,
                                     int *status_code_out,
-                                    const std::vector<std::pair<std::string,std::string>> &extra_headers = {}) {
+                                    const std::vector<std::pair<std::string,std::string>> &extra_headers = {},
+                                    const char *client_ip = nullptr,
+                                    const char *host_hdr = nullptr) {
     if (status_code_out != nullptr) {
         *status_code_out = 0;
     }
@@ -894,8 +964,11 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     struct mg_connection *target = nullptr;
     bool reused = false;
 
-    // Try to acquire from pool
-    target = GatewayConnectionPool::get().acquire(route.host, route.port, route.use_tls);
+    // Try to acquire from pool using pre-computed key
+    const std::string &effective_pool_key =
+        !route.pool_key.empty() ? route.pool_key
+            : (route.host + ":" + std::to_string(route.port) + (route.use_tls ? "s" : ""));
+    target = GatewayConnectionPool::get().acquire(effective_pool_key);
     if (target) {
         reused = true;
     } else {
@@ -903,11 +976,17 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
 
     if (target == nullptr) {
-        php_error_docref(nullptr, E_WARNING, "Upstream connect failed for %s://%s:%d (%s)",
-                         route.use_tls ? "https" : "http",
-                         route.host.c_str(),
-                         route.port,
-                         error_buf[0] != '\0' ? error_buf : "unknown error");
+        // NOT php_error_docref: this runs on an arbitrary civetweb worker thread.
+        // php_error_docref ultimately calls into Zend's memory manager (_emalloc),
+        // which has no per-thread isolation on an NTS build. Concurrent calls from
+        // multiple worker threads corrupt the shared Zend heap and trigger
+        // zend_mm_panic() -> abort(), crashing the whole process. Plain stderr
+        // logging never touches the Zend engine, so it's safe from any thread.
+        std::fprintf(stderr, "[kislayphp_gateway] WARNING: Upstream connect failed for %s://%s:%d (%s)\n",
+                     route.use_tls ? "https" : "http",
+                     route.host.c_str(),
+                     route.port,
+                     error_buf[0] != '\0' ? error_buf : "unknown error");
         kislayphp_send_error(conn, 502, "Upstream connect failed");
         if (status_code_out != nullptr) {
             *status_code_out = 502;
@@ -924,20 +1003,32 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
 
     std::string method = info->request_method ? info->request_method : "GET";
     bool body_consumed = false;
-    
-    auto do_proxy = [&](struct mg_connection *tgt) mutable -> bool {
-        mg_printf(tgt, "%s %s HTTP/1.1\r\n", method.c_str(), target_path.c_str());
-        mg_printf(tgt, "Host: %s:%d\r\n", route.host.c_str(), route.port);
-        mg_printf(tgt, "Connection: keep-alive\r\n");
 
-        // X-Forwarded Headers
-        mg_printf(tgt, "X-Forwarded-For: %s\r\n", kislayphp_client_identifier(info).c_str());
-        mg_printf(tgt, "X-Forwarded-Proto: %s\r\n", route.use_tls ? "https" : "http");
-        const char *host_hdr = kislayphp_get_header(info, "Host");
-        mg_printf(tgt, "X-Forwarded-Host: %s\r\n", host_hdr ? host_hdr : "unknown");
+    auto do_proxy = [&](struct mg_connection *tgt) mutable -> bool {
+        // Build entire request header block into one buffer — single mg_write syscall
+        // instead of 8-15 mg_printf calls, saving ~1-3µs in syscall overhead.
+        thread_local std::string req_buf;
+        req_buf.clear();
+        req_buf.reserve(512);
+
+        req_buf += method;
+        req_buf += ' ';
+        req_buf += target_path;
+        req_buf += " HTTP/1.1\r\nHost: ";
+        req_buf += route.upstream_key;  // pre-computed "host:port"
+        req_buf += "\r\nConnection: keep-alive\r\nX-Forwarded-For: ";
+        req_buf += client_ip ? client_ip : kislayphp_client_identifier(info).c_str();
+        req_buf += "\r\nX-Forwarded-Proto: ";
+        req_buf += route.use_tls ? "https" : "http";
+        req_buf += "\r\nX-Forwarded-Host: ";
+        req_buf += host_hdr ? host_hdr : "unknown";
+        req_buf += "\r\n";
 
         for (const auto &h : extra_headers) {
-            mg_printf(tgt, "%s: %s\r\n", h.first.c_str(), h.second.c_str());
+            req_buf += h.first;
+            req_buf += ": ";
+            req_buf += h.second;
+            req_buf += "\r\n";
         }
 
         bool has_content_length = false;
@@ -945,21 +1036,24 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
             const char *name = info->http_headers[i].name;
             const char *value = info->http_headers[i].value;
             if (name == nullptr || value == nullptr) continue;
-            if (::strcasecmp(name, "Host") == 0 || 
-                ::strcasecmp(name, "X-Forwarded-For") == 0 ||
-                ::strcasecmp(name, "X-Forwarded-Proto") == 0 ||
-                ::strcasecmp(name, "X-Forwarded-Host") == 0 ||
-                kislayphp_is_hop_header(name)) {
-                continue;
-            }
-            if (::strcasecmp(name, "Content-Length") == 0) has_content_length = true;
-            mg_printf(tgt, "%s: %s\r\n", name, value);
+            if (kislayphp_skip_upstream_header(name)) continue;
+            if ((name[0] | 0x20) == 'c' && ::strcasecmp(name, "Content-Length") == 0) has_content_length = true;
+            req_buf += name;
+            req_buf += ": ";
+            req_buf += value;
+            req_buf += "\r\n";
         }
 
         if (!has_content_length && info->content_length >= 0) {
-            mg_printf(tgt, "Content-Length: %lld\r\n", static_cast<long long>(info->content_length));
+            char cl_buf[32];
+            snprintf(cl_buf, sizeof(cl_buf), "%lld", static_cast<long long>(info->content_length));
+            req_buf += "Content-Length: ";
+            req_buf += cl_buf;
+            req_buf += "\r\n";
         }
-        mg_printf(tgt, "\r\n");
+        req_buf += "\r\n";
+
+        if (mg_write(tgt, req_buf.data(), req_buf.size()) <= 0) return false;
 
         if (info->content_length > 0) {
             char buffer[16384];
@@ -1004,14 +1098,24 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     int status_code = resp_info ? resp_info->status_code : 502;
     if (status_code_out != nullptr) *status_code_out = status_code;
     const char *status_text = (resp_info && resp_info->status_text) ? resp_info->status_text : "Bad Gateway";
-    mg_printf(conn, "HTTP/1.1 %d %s\r\n", status_code, status_text);
 
     bool resp_has_length = false;
     bool upstream_keep_alive = false;
-    if (resp_info && resp_info->http_version && 
+    if (resp_info && resp_info->http_version &&
         (std::strcmp(resp_info->http_version, "1.1") == 0 || std::strcmp(resp_info->http_version, "1.2") == 0)) {
         upstream_keep_alive = true;
     }
+
+    // Buffer entire response header block for a single downstream write syscall.
+    thread_local std::string resp_buf;
+    resp_buf.clear();
+    resp_buf.reserve(256);
+    resp_buf += "HTTP/1.1 ";
+    char sc_buf[16];
+    snprintf(sc_buf, sizeof(sc_buf), "%d ", status_code);
+    resp_buf += sc_buf;
+    resp_buf += status_text;
+    resp_buf += "\r\n";
 
     if (resp_info) {
         for (int i = 0; i < resp_info->num_headers; ++i) {
@@ -1025,10 +1129,17 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
             }
             if (kislayphp_is_hop_header(name)) continue;
             if (::strcasecmp(name, "Content-Length") == 0) resp_has_length = true;
-            mg_printf(conn, "%s: %s\r\n", name, value);
+            resp_buf += name;
+            resp_buf += ": ";
+            resp_buf += value;
+            resp_buf += "\r\n";
         }
         if (!resp_has_length && resp_info->content_length >= 0) {
-            mg_printf(conn, "Content-Length: %lld\r\n", resp_info->content_length);
+            char cl_buf[32];
+            snprintf(cl_buf, sizeof(cl_buf), "%lld", static_cast<long long>(resp_info->content_length));
+            resp_buf += "Content-Length: ";
+            resp_buf += cl_buf;
+            resp_buf += "\r\n";
             resp_has_length = true;
         }
     }
@@ -1036,7 +1147,10 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
         !kislayphp_request_wants_close(info) &&
         resp_has_length &&
         status_code != 101;
-    mg_printf(conn, "Connection: %s\r\n\r\n", downstream_keep_alive ? "keep-alive" : "close");
+    resp_buf += "Connection: ";
+    resp_buf += downstream_keep_alive ? "keep-alive" : "close";
+    resp_buf += "\r\n\r\n";
+    mg_write(conn, resp_buf.data(), resp_buf.size());
 
     char buffer[16384];
     int read_len = 0;
@@ -1070,11 +1184,28 @@ static bool kislayphp_proxy_request(struct mg_connection *conn,
     }
 
     if (upstream_keep_alive && read_ok) {
-        GatewayConnectionPool::get().release(target, route.host, route.port, route.use_tls);
+        GatewayConnectionPool::get().release(target, effective_pool_key);
     } else {
         mg_close_connection(target);
     }
     return read_ok;
+}
+
+// Returns the per-host circuit-breaker state, creating it on first access.
+// Fast path: shared (reader) lock — multiple threads find their pre-populated entry
+// without blocking each other. Slow path: exclusive lock + double-check for the rare
+// dynamic-service host not yet in the map.
+static std::shared_ptr<PerHostCircuitState> kislayphp_get_circuit_state(
+        php_kislayphp_gateway_t *gw, const std::string &key) {
+    {
+        std::shared_lock<std::shared_mutex> rl(gw->circuit_map_lock);
+        auto it = gw->circuit_states.find(key);
+        if (it != gw->circuit_states.end()) return it->second;
+    }
+    std::unique_lock<std::shared_mutex> wl(gw->circuit_map_lock);
+    auto &slot = gw->circuit_states[key];
+    if (!slot) slot = std::make_shared<PerHostCircuitState>();
+    return slot;
 }
 
 static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
@@ -1085,17 +1216,54 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
 
     auto *gateway = static_cast<php_kislayphp_gateway_t *>(info->user_data);
     std::string method = info->request_method ? info->request_method : "";
-    method = kislayphp_to_upper(method);
+    kislayphp_uppercase_inplace(method);
     std::string path = info->local_uri ? info->local_uri : (info->request_uri ? info->request_uri : "");
+
+    // Single-pass header extraction: scan request headers once for all handler decisions.
+    const char *hdr_authorization   = nullptr;
+    const char *hdr_x_forwarded_for = nullptr;
+    const char *hdr_traceparent     = nullptr;
+    const char *hdr_tracestate      = nullptr;
+    const char *hdr_host            = nullptr;
+    for (int i = 0; i < info->num_headers; ++i) {
+        const char *n = info->http_headers[i].name;
+        const char *v = info->http_headers[i].value;
+        if (n == nullptr || v == nullptr) continue;
+        if      (!hdr_authorization   && ::strcasecmp(n, "Authorization")   == 0) hdr_authorization   = v;
+        else if (!hdr_x_forwarded_for && ::strcasecmp(n, "X-Forwarded-For") == 0) hdr_x_forwarded_for = v;
+        else if (!hdr_traceparent     && ::strcasecmp(n, "traceparent")      == 0) hdr_traceparent     = v;
+        else if (!hdr_tracestate      && ::strcasecmp(n, "tracestate")       == 0) hdr_tracestate      = v;
+        else if (!hdr_host            && ::strcasecmp(n, "Host")             == 0) hdr_host            = v;
+    }
+
+    // Compute client identifier once — used for rate-limit key and X-Forwarded-For.
+    std::string client_id;
+    if (hdr_x_forwarded_for != nullptr && *hdr_x_forwarded_for != '\0') {
+        const char *comma = std::strchr(hdr_x_forwarded_for, ',');
+        if (comma != nullptr) {
+            const char *end = comma;
+            while (end > hdr_x_forwarded_for &&
+                   std::isspace(static_cast<unsigned char>(*(end - 1))))
+                --end;
+            client_id.assign(hdr_x_forwarded_for, end);
+        } else {
+            client_id = kislayphp_trim(std::string(hdr_x_forwarded_for));
+        }
+    } else {
+        client_id.assign(info->remote_addr ? info->remote_addr : "unknown");
+    }
 
     // Auth check: JWT (HS256) when jwt_secret is set; legacy bearer token otherwise.
     // Validated sub/roles are forwarded as upstream headers via extra_proxy_headers.
-    std::vector<std::pair<std::string,std::string>> extra_proxy_headers;
-    extra_proxy_headers.reserve(4);
+    // thread_local: civetweb threads process one request at a time, so reusing the
+    // vector's already-grown capacity avoids a heap allocation on every request
+    // (most requests carry no auth/tracing headers and never need >0 entries).
+    thread_local std::vector<std::pair<std::string,std::string>> extra_proxy_headers;
+    extra_proxy_headers.clear();
 
     if (gateway->auth_required) {
         if (!kislay_gateway_path_excluded(path, gateway->auth_exclude_prefixes)) {
-            const char *auth_hdr = kislayphp_get_header(info, "Authorization");
+            const char *auth_hdr = hdr_authorization;
 
             if (!gateway->jwt_secret.empty()) {
                 // JWT validation mode (HS256)
@@ -1151,23 +1319,29 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 now_tp.time_since_epoch()).count());
         int64_t window_ms = static_cast<int64_t>(gateway->rate_limit_window_seconds) * 1000LL;
-        std::string key = kislayphp_client_identifier(info);
-        key.push_back('|');
-        key.append(method);
-        std::lock_guard<std::mutex> guard(gateway->lock);
-        // Prune stale rate-limit entries every 10 000 requests to prevent
-        // unbounded map growth under DDoS with many source IPs.
+        // Hash directly from the two string components — no heap allocation.
+        uint64_t rl_key = kislayphp_rl_hash(client_id.data(), client_id.size(),
+                                             method.data(), method.size());
+
+        // Prune one shard per 16384 requests to bound map growth under DDoS.
+        // Pruning is done before acquiring the request shard so the two lock
+        // acquisitions are independent even when they target the same shard.
         uint64_t cnt = gateway->rate_limit_request_counter.fetch_add(1, std::memory_order_relaxed);
-        if ((cnt & 0x3FFF) == 0 && cnt > 0) {  // every 16384 requests
-            for (auto it = gateway->rate_limits.begin(); it != gateway->rate_limits.end(); ) {
-                if ((now_ms - it->second.window_start_ms) > window_ms * 2) {
-                    it = gateway->rate_limits.erase(it);
-                } else {
+        if ((cnt & 0x3FFF) == 0 && cnt > 0) {
+            size_t prune_idx = (cnt >> 14) & (RATE_LIMIT_SHARDS - 1);
+            std::lock_guard<std::mutex> pg(gateway->rate_limit_shards[prune_idx].lock);
+            auto &pe = gateway->rate_limit_shards[prune_idx].entries;
+            for (auto it = pe.begin(); it != pe.end(); ) {
+                if ((now_ms - it->second.window_start_ms) > window_ms * 2)
+                    it = pe.erase(it);
+                else
                     ++it;
-                }
             }
         }
-        auto &entry = gateway->rate_limits[key];
+
+        size_t shard_idx = rl_key & (RATE_LIMIT_SHARDS - 1);
+        std::lock_guard<std::mutex> guard(gateway->rate_limit_shards[shard_idx].lock);
+        auto &entry = gateway->rate_limit_shards[shard_idx].entries[rl_key];
         if (entry.window_start_ms == 0 || (now_ms - entry.window_start_ms) >= window_ms) {
             entry.window_start_ms = now_ms;
             entry.count = 0;
@@ -1181,8 +1355,8 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
 
     // W3C Trace Context: forward or generate traceparent/tracestate for upstream
     {
-        const char *tp_hdr = kislayphp_get_header(info, "traceparent");
-        const char *ts_hdr = kislayphp_get_header(info, "tracestate");
+        const char *tp_hdr = hdr_traceparent;
+        const char *ts_hdr = hdr_tracestate;
         if (tp_hdr) {
             extra_proxy_headers.emplace_back("traceparent", std::string(tp_hdr));
         } else if (gateway->trace_enabled) {
@@ -1201,8 +1375,10 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
     bool found = false;
     if (gateway->route_table_frozen.load(std::memory_order_acquire)) {
         // Lock-free hot path: O(1) hash lookup, then short prefix scan.
-        std::string key;
-        key.reserve(method.size() + 1 + path.size());
+        // thread_local: civetweb threads handle one request at a time, so reusing
+        // the string's already-grown capacity avoids a heap allocation per request.
+        thread_local std::string key;
+        key.clear();
         key = method;
         key += '\0';
         key += path;
@@ -1281,7 +1457,13 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 std::string resolver_error;
                 ok = kislayphp_call_php(&resolver, 3, args, &retval, &resolver_error);
                 if ((!ok || EG(exception) != nullptr) && !resolver_error.empty()) {
-                    php_error_docref(nullptr, E_WARNING, "Gateway resolver failure: %s", resolver_error.c_str());
+                    // See the comment at the "Upstream connect failed" warning above:
+                    // php_error_docref is unsafe from a civetweb worker thread on NTS.
+                    // (Note: calling the PHP resolver callback itself via kislayphp_call_php
+                    // just above is its own, separate, pre-existing thread-safety concern —
+                    // out of scope here since this path isn't exercised by native/registered
+                    // services, only by the PHP-callback resolver fallback.)
+                    std::fprintf(stderr, "[kislayphp_gateway] WARNING: Gateway resolver failure: %s\n", resolver_error.c_str());
                 }
             }
             zval_ptr_dtor(&args[0]);
@@ -1315,72 +1497,66 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 kislayphp_send_error(conn, 502, "Invalid upstream target");
                 return 1;
             }
+            kislayphp_compute_route_keys(resolved);
         }
         if (gateway->circuit_breaker_enabled) {
             int64_t now_ms = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
             std::string upstream_key = resolved.host + ":" + std::to_string(resolved.port);
-            {
-                std::lock_guard<std::mutex> guard(gateway->lock);
-                auto it = gateway->circuit_states.find(upstream_key);
-                if (it != gateway->circuit_states.end() && it->second.open_until_ms > now_ms) {
-                    kislayphp_send_error(conn, 503, "Circuit breaker open");
-                    return 1;
-                }
+            auto cb_state = kislayphp_get_circuit_state(gateway, upstream_key);
+            if (cb_state->open_until_ms.load(std::memory_order_acquire) > now_ms) {
+                kislayphp_send_error(conn, 503, "Circuit breaker open");
+                return 1;
             }
 
             int upstream_status = 0;
-            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
+            bool ok_proxy = kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, &upstream_status, extra_proxy_headers, client_id.c_str(), hdr_host);
             bool failed = !ok_proxy || upstream_status >= 500;
-            std::lock_guard<std::mutex> guard(gateway->lock);
-            auto &state = gateway->circuit_states[upstream_key];
             if (failed) {
-                state.failures++;
-                if (state.failures >= gateway->circuit_failure_threshold) {
-                    state.open_until_ms = now_ms + static_cast<int64_t>(gateway->circuit_open_seconds) * 1000LL;
-                    state.failures = 0;
+                zend_long f = cb_state->failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+                if (f >= gateway->circuit_failure_threshold) {
+                    cb_state->open_until_ms.store(
+                        now_ms + static_cast<int64_t>(gateway->circuit_open_seconds) * 1000LL,
+                        std::memory_order_release);
+                    cb_state->failures.store(0, std::memory_order_release);
                 }
             } else {
-                state.failures = 0;
-                state.open_until_ms = 0;
+                cb_state->failures.store(0, std::memory_order_release);
+                cb_state->open_until_ms.store(0, std::memory_order_release);
             }
             return 1;
         }
 
-        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr, extra_proxy_headers);
+        kislayphp_proxy_request(conn, info, resolved, gateway->max_body_bytes, nullptr, extra_proxy_headers, client_id.c_str(), hdr_host);
         return 1;
     }
 
     if (gateway->circuit_breaker_enabled) {
         int64_t now_ms = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-        std::string upstream_key = match.host + ":" + std::to_string(match.port);
-        {
-            std::lock_guard<std::mutex> guard(gateway->lock);
-            auto it = gateway->circuit_states.find(upstream_key);
-            if (it != gateway->circuit_states.end() && it->second.open_until_ms > now_ms) {
-                kislayphp_send_error(conn, 503, "Circuit breaker open");
-                return 1;
-            }
+        auto cb_state = kislayphp_get_circuit_state(gateway, match.upstream_key);
+        if (cb_state->open_until_ms.load(std::memory_order_acquire) > now_ms) {
+            kislayphp_send_error(conn, 503, "Circuit breaker open");
+            return 1;
         }
 
         int upstream_status = 0;
-        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status, extra_proxy_headers);
+        bool ok_proxy = kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, &upstream_status, extra_proxy_headers, client_id.c_str(), hdr_host);
         bool failed = !ok_proxy || upstream_status >= 500;
-        std::lock_guard<std::mutex> guard(gateway->lock);
-        auto &state = gateway->circuit_states[upstream_key];
         if (failed) {
-            state.failures++;
-            if (state.failures >= gateway->circuit_failure_threshold) {
-                state.open_until_ms = now_ms + static_cast<int64_t>(gateway->circuit_open_seconds) * 1000LL;
-                state.failures = 0;
+            zend_long f = cb_state->failures.fetch_add(1, std::memory_order_acq_rel) + 1;
+            if (f >= gateway->circuit_failure_threshold) {
+                cb_state->open_until_ms.store(
+                    now_ms + static_cast<int64_t>(gateway->circuit_open_seconds) * 1000LL,
+                    std::memory_order_release);
+                cb_state->failures.store(0, std::memory_order_release);
             }
         } else {
-            state.failures = 0;
-            state.open_until_ms = 0;
+            cb_state->failures.store(0, std::memory_order_release);
+            cb_state->open_until_ms.store(0, std::memory_order_release);
         }
         return 1;
     }
 
-    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr, extra_proxy_headers);
+    kislayphp_proxy_request(conn, info, match, gateway->max_body_bytes, nullptr, extra_proxy_headers, client_id.c_str(), hdr_host);
     return 1;
 }
 
@@ -1535,6 +1711,7 @@ PHP_METHOD(KislayPHPGateway, registerService) {
             zend_throw_exception(zend_ce_exception, "Invalid service target (expected http(s)://host[:port][/base])", 0);
             RETURN_FALSE;
         }
+        kislayphp_compute_route_keys(route);
         entry->targets.push_back(std::move(route));
     } ZEND_HASH_FOREACH_END();
 
@@ -1648,24 +1825,53 @@ PHP_METHOD(KislayPHPGateway, listen) {
     // Build frozen route table before starting threads so all reads are lock-free.
     // Exact paths go into an unordered_map (O(1)); wildcard paths (*) go into a
     // vector sorted longest-prefix-first so the most specific pattern wins.
+    // Also pre-populate circuit_states for all static upstreams so the hot path
+    // always hits the fast shared-lock read in kislayphp_get_circuit_state().
     {
         obj->frozen_exact.reserve(obj->routes.size());
-        for (const auto &r : obj->routes) {
+        for (auto r : obj->routes) {
+            if (!r.use_service) {
+                r.upstream_key = r.host + ":" + std::to_string(r.port);
+                r.pool_key     = r.upstream_key + (r.use_tls ? "s" : "");
+            }
             if (!r.path.empty() && r.path.back() == '*') {
-                obj->frozen_prefix.push_back(r);
+                obj->frozen_prefix.push_back(std::move(r));
             } else {
                 std::string key;
                 key.reserve(r.method.size() + 1 + r.path.size());
                 key = r.method;
                 key += '\0';
                 key += r.path;
-                obj->frozen_exact.emplace(std::move(key), r);
+                obj->frozen_exact.emplace(std::move(key), std::move(r));
             }
         }
         std::sort(obj->frozen_prefix.begin(), obj->frozen_prefix.end(),
             [](const kislayphp_gateway_route &a, const kislayphp_gateway_route &b) {
                 return a.path.size() > b.path.size();
             });
+        // Pre-populate circuit_states for all known static upstreams. Runs before
+        // mg_start() so no lock needed — guarantees the hot path always finds its
+        // entry via the cheap shared_lock read, never the exclusive write path.
+        if (obj->circuit_breaker_enabled) {
+            for (const auto &pair : obj->frozen_exact) {
+                const auto &r = pair.second;
+                if (!r.use_service && !r.upstream_key.empty()) {
+                    auto &slot = obj->circuit_states[r.upstream_key];
+                    if (!slot) slot = std::make_shared<PerHostCircuitState>();
+                }
+            }
+            for (const auto &r : obj->frozen_prefix) {
+                if (!r.use_service && !r.upstream_key.empty()) {
+                    auto &slot = obj->circuit_states[r.upstream_key];
+                    if (!slot) slot = std::make_shared<PerHostCircuitState>();
+                }
+            }
+            if (obj->has_fallback && !obj->fallback_route.use_service &&
+                    !obj->fallback_route.upstream_key.empty()) {
+                auto &slot = obj->circuit_states[obj->fallback_route.upstream_key];
+                if (!slot) slot = std::make_shared<PerHostCircuitState>();
+            }
+        }
         obj->route_table_frozen.store(true, std::memory_order_release);
     }
 
@@ -1701,6 +1907,7 @@ PHP_METHOD(KislayPHPGateway, setFallbackTarget) {
         zend_throw_exception(zend_ce_exception, "Invalid fallback target (expected http(s)://host[:port][/base])", 0);
         RETURN_FALSE;
     }
+    kislayphp_compute_route_keys(route);
 
     std::lock_guard<std::mutex> guard(obj->lock);
     obj->fallback_route = route;

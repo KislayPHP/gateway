@@ -71,6 +71,7 @@ $gw->requireAuth($jwtSecret, [
 ]);
 $gw->addRoute('GET', '/secure/data',    $backendUrl);
 $gw->addRoute('GET', '/secure/headers', $backendUrl);
+$gw->addRoute('GET', '/secure/json',    $backendUrl);
 
 // ── Native service registry (round-robin load balancing) ─────────────────────
 $gw->addServiceRoute('GET', '/lb/json',      'backend-pool');

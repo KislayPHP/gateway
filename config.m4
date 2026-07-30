@@ -14,7 +14,7 @@ if test "$PHP_KISLAYPHP_GATEWAY" != "no"; then
   PHP_SUBST(KISLAYPHP_GATEWAY_SHARED_LIBADD)
 
   CFLAGS="$CFLAGS -DOPENSSL_API_3_0"
-  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0"
+  CXXFLAGS="$CXXFLAGS -DOPENSSL_API_3_0 -std=c++17"
   if test -f ../rpc/gen/discovery.pb.cc; then
     RPC_GEN_DIR=`pwd`/../rpc/gen
     PHP_ADD_INCLUDE($RPC_GEN_DIR)
