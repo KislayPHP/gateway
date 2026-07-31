@@ -522,14 +522,17 @@ static bool kislayphp_path_matches(const std::string &pattern, const std::string
     if (pattern.back() != '*') {
         return false;
     }
-    std::string prefix = pattern.substr(0, pattern.size() - 1);
-    if (prefix.empty()) {
+    const std::size_t prefix_len = pattern.size() - 1;
+    if (prefix_len == 0) {
         return true;
     }
-    if (path.size() < prefix.size()) {
+    if (path.size() < prefix_len) {
         return false;
     }
-    return path.compare(0, prefix.size(), prefix) == 0;
+    // Compare path's and pattern's leading prefix_len characters directly —
+    // pattern.substr(0, prefix_len) would allocate a temporary string on
+    // every call, every request that falls through to a wildcard route scan.
+    return path.compare(0, prefix_len, pattern, 0, prefix_len) == 0;
 }
 
 static bool kislayphp_parse_target(const std::string &target, kislayphp_gateway_route &route) {
