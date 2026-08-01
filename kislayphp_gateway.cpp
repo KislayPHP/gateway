@@ -1823,6 +1823,16 @@ PHP_METHOD(KislayPHPGateway, listen) {
     options.push_back("yes");
     options.push_back("keep_alive_timeout_ms");
     options.push_back("30000");
+    // Without this, civetweb leaves Nagle's algorithm on for accepted sockets.
+    // Response headers and body go out as two separate mg_write() calls
+    // (kislayphp_proxy_request streams the body to avoid buffering large
+    // upstream responses), so the second write sits behind Nagle waiting for
+    // the client's ACK of the first — and that ACK is itself delayed (~40ms)
+    // since the client has nothing to piggyback it on. Confirmed via a Linux
+    // repro: every proxied request took a consistent ~42ms with idle,
+    // otherwise-instant backends, capping throughput at num_threads/42ms.
+    options.push_back("tcp_nodelay");
+    options.push_back("1");
     options.push_back(nullptr);
 
     // Build frozen route table before starting threads so all reads are lock-free.
