@@ -595,7 +595,22 @@ static void kislayphp_compute_route_keys(kislayphp_gateway_route &route) {
     route.pool_key = route.upstream_key + (route.use_tls ? "s" : "");
 }
 
+// Gateway's civetweb server can run with num_threads > 1 (KISLAY_GATEWAY_THREADS,
+// Gateway::setThreads()), and the ONLY PHP callback Gateway ever invokes from a
+// worker thread is the setResolver() callback, called via kislayphp_call_php()
+// below. On an NTS build there's no per-thread Zend engine isolation, so two
+// worker threads resolving concurrently would race on the same executor/
+// allocator state with no happens-before edge - the same zend_mm heap
+// corruption class found and fixed in kislayphp/socket's civetweb callback
+// path this session (kislay_socket_php_call_lock) and in kislayphp/queue's
+// per-connection request handler (kislay_queue_php_call_lock). This currently
+// sits dormant because the thread count defaults to 1, but setResolver() is
+// exactly the pattern a dynamic-discovery-backed gateway needs multiple
+// threads for, so it's a live risk the moment someone raises that default.
+static std::recursive_mutex kislayphp_call_php_lock;
+
 static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *retval, std::string *error_out = nullptr) {
+    std::lock_guard<std::recursive_mutex> php_guard(kislayphp_call_php_lock);
     ZVAL_UNDEF(retval);
     if (call_user_function(EG(function_table), nullptr, callable, retval, argc, argv) == FAILURE) {
         if (error_out != nullptr) {
@@ -1431,6 +1446,13 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
         zval resolver;
         ZVAL_UNDEF(&resolver);
         bool has_resolver = false;
+        // kislayphp_call_php_lock guards every Zend touch in this resolver path,
+        // starting here: ZVAL_COPY below allocates/increments a zend_string same
+        // as everything else in this block (see the longer comment further down).
+        // Held across the nested gateway->lock too, consistent with the fixed
+        // ordering used everywhere else in this codebase this session
+        // (php_call_lock outermost, data locks nested inside, never reversed).
+        std::lock_guard<std::recursive_mutex> php_guard(kislayphp_call_php_lock);
         if (!native_ok) {
             std::lock_guard<std::mutex> guard(gateway->lock);
             if (gateway->has_resolver) {
@@ -1450,6 +1472,15 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 kislayphp_send_error(conn, 502, "Service resolver not configured");
                 return 1;
             }
+            std::string target;
+            // Already covered by php_guard, acquired above the resolver zval
+            // copy: ZVAL_STRING allocates a new zend_string, zval_ptr_dtor frees
+            // one, kislayphp_call_php() invokes the resolver itself - all Zend
+            // engine/zend_mm touches from this civetweb worker thread. An
+            // earlier version of this fix only wrapped the inner
+            // call_user_function() call and still crashed under real concurrent
+            // load ("zend_mm_heap corrupted", reproduced via wrk) because these
+            // surrounding ZVAL_STRING/zval_ptr_dtor calls raced just as easily.
             zval args[3];
             ZVAL_STRING(&args[0], match.service.c_str());
             ZVAL_STRING(&args[1], method.c_str());
@@ -1462,10 +1493,6 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 if ((!ok || EG(exception) != nullptr) && !resolver_error.empty()) {
                     // See the comment at the "Upstream connect failed" warning above:
                     // php_error_docref is unsafe from a civetweb worker thread on NTS.
-                    // (Note: calling the PHP resolver callback itself via kislayphp_call_php
-                    // just above is its own, separate, pre-existing thread-safety concern —
-                    // out of scope here since this path isn't exercised by native/registered
-                    // services, only by the PHP-callback resolver fallback.)
                     std::fprintf(stderr, "[kislayphp_gateway] WARNING: Gateway resolver failure: %s\n", resolver_error.c_str());
                 }
             }
@@ -1475,7 +1502,6 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
             if (has_resolver) {
                 zval_ptr_dtor(&resolver);
             }
-            std::string target;
             if (has_resolver) {
                 if (!ok || EG(exception) != nullptr || Z_TYPE(retval) != IS_STRING) {
                     if (ok) {
