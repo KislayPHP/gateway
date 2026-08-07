@@ -151,6 +151,7 @@ Gateway keeps resilience lightweight:
 - `registerService()` is the recommended production service discovery path. It publishes a native registry snapshot and avoids PHP callbacks on the request path.
 - On ZTS builds, PHP resolvers are rejected at `listen()` time. Use Discovery RPC or direct targets there.
 - Rate limiting currently uses in-memory storage.
+- **Do not load `gateway`, `core`, and `socket` together in the same PHP process.** All three vendor their own copy of civetweb and export non-static symbols like `mg_start`; on platforms linking extensions with `-flat_namespace` (notably macOS), combining any two of them risks one's compiled civetweb code silently shadowing another's, with no error - just undefined behavior up to and including crashes. Run gateway as its own process in front of separate core/socket processes rather than combining them via `-d extension=` flags.
 
 ## License
 
