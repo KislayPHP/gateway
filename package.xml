@@ -14,17 +14,17 @@
     <email>kislayraj.89@gmail.com</email>
     <active>yes</active>
   </lead>
-  <date>2026-04-01</date>
+  <date>2026-08-08</date>
   <version>
-    <release>0.0.9</release>
-    <api>0.0.9</api>
+    <release>1.0.1</release>
+    <api>1.0.1</api>
   </version>
   <stability>
     <release>beta</release>
     <api>beta</api>
   </stability>
   <license>Apache-2.0</license>
-  <notes>Release 0.0.9: add native C++ service registry for production-safe service routing without PHP callbacks in the hot path.</notes>
+  <notes>Release 1.0.1: serialize Zend engine access from the setResolver() callback path, civetweb symbol isolation, tcp_nodelay fix for multi-host proxy throughput collapse, native-pool load-balancing perf fix.</notes>
   <contents>
     <dir name="/">
       <file name="config.m4" role="src" />
