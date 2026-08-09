@@ -626,10 +626,27 @@ static bool kislayphp_call_php(zval *callable, uint32_t argc, zval *argv, zval *
                 *error_out += " (" + exception_text + ")";
             }
         }
+        // An uncaught exception thrown by the callable is the common cause of
+        // FAILURE too (e.g. a resolver's "no healthy instance" RuntimeException).
+        // Leaving it set here means it re-surfaces as an uncaught fatal error
+        // the next time PHP checks EG(exception) - which kills this whole
+        // long-running Gateway process over a single resolver failure that the
+        // caller (see setResolver() dispatch below) already handles as a
+        // per-request 502. We've already captured everything useful from it
+        // into *error_out above, so it's safe to clear here.
+        if (EG(exception) != nullptr) {
+            zend_clear_exception();
+        }
         return false;
     }
-    if (error_out != nullptr && EG(exception) != nullptr) {
-        *error_out = "exception in callback (" + kislayphp_exception_debug_string() + ")";
+    if (EG(exception) != nullptr) {
+        if (error_out != nullptr) {
+            *error_out = "exception in callback (" + kislayphp_exception_debug_string() + ")";
+        }
+        // Same reasoning as above: this callable's exception has been fully
+        // handled (converted to *error_out for the caller to act on), so don't
+        // let it live on to crash the process later.
+        zend_clear_exception();
     }
     return true;
 }
