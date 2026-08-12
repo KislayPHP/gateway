@@ -23,6 +23,7 @@ extern "C" {
 #include <shared_mutex>
 #include <strings.h>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 #ifdef __linux__
@@ -518,12 +519,55 @@ static std::string kislayphp_join_paths(const std::string &base, const std::stri
     return base + path;
 }
 
+// Splits on '/', skipping empty segments (so leading/trailing/duplicate
+// slashes don't produce spurious empty segments) — string_views borrow from
+// the caller's std::string, no per-segment allocation.
+static void kislayphp_split_path_segments(const std::string &s, std::vector<std::string_view> &out) {
+    size_t start = 0;
+    while (start < s.size()) {
+        while (start < s.size() && s[start] == '/') start++;
+        if (start >= s.size()) break;
+        size_t end = s.find('/', start);
+        if (end == std::string::npos) end = s.size();
+        out.emplace_back(s.data() + start, end - start);
+        start = end;
+    }
+}
+
+// Segment-by-segment match: a ':'-prefixed pattern segment matches any
+// non-empty path segment (value not extracted — Gateway only needs a
+// boolean match to pick an upstream, unlike Core's router which also
+// populates $req->input() from named segments). Only reached for patterns
+// that actually contain ':', so the exact-match/wildcard-prefix fast paths
+// below are entirely unaffected — no allocation on the hot path for the
+// common case of literal or '*'-suffixed routes.
+static bool kislayphp_segmented_path_matches(const std::string &pattern, const std::string &path) {
+    std::vector<std::string_view> pattern_segs, path_segs;
+    kislayphp_split_path_segments(pattern, pattern_segs);
+    kislayphp_split_path_segments(path, path_segs);
+    if (pattern_segs.size() != path_segs.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < pattern_segs.size(); ++i) {
+        if (!pattern_segs[i].empty() && pattern_segs[i][0] == ':') {
+            continue;
+        }
+        if (pattern_segs[i] != path_segs[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool kislayphp_path_matches(const std::string &pattern, const std::string &path) {
     if (pattern.empty()) {
         return path.empty() || path == "/";
     }
     if (pattern == path) {
         return true;
+    }
+    if (pattern.find(':') != std::string::npos) {
+        return kislayphp_segmented_path_matches(pattern, path);
     }
     if (pattern.back() != '*') {
         return false;
@@ -1954,7 +1998,11 @@ PHP_METHOD(KislayPHPGateway, listen) {
                 r.upstream_key = r.host + ":" + std::to_string(r.port);
                 r.pool_key     = r.upstream_key + (r.use_tls ? "s" : "");
             }
-            if (!r.path.empty() && r.path.back() == '*') {
+            // ':'-containing patterns need kislayphp_path_matches()'s segmented
+            // comparison, same as trailing-'*' wildcards - route both into the
+            // scanned bucket, never the exact-string hashmap (which would only
+            // ever match the literal pattern text, never a real path).
+            if (!r.path.empty() && (r.path.back() == '*' || r.path.find(':') != std::string::npos)) {
                 obj->frozen_prefix.push_back(std::move(r));
             } else {
                 std::string key;

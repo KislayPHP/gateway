@@ -66,6 +66,8 @@ while (true) {
 }
 ```
 
+`addRoute()` path patterns support three shapes: an exact literal path (`/health`), a trailing `*` wildcard prefix (`/api/*` matches any path starting with `/api/`), or `:name`-style named segments matching Core's own router syntax (`/api/tasks/:id` matches `/api/tasks/42` but not `/api/tasks` or `/api/tasks/42/sub` — segment count must match exactly). Named segments are match-only here — Gateway doesn't expose the captured value to anything, it only decides which upstream a request forwards to.
+
 ## Discovery Integration
 
 ```php
