@@ -12,6 +12,7 @@ extern "C" {
 #include <chrono>
 #include <civetweb.h>
 #include <algorithm>
+#include "../kislayphp_utils.h"
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -854,22 +855,16 @@ static bool kislay_gateway_validate_jwt(const std::string &token,
     std::string payload_json;
     if (!kislay_gateway_base64url_decode(payload_b64, payload_json)) return false;
 
-    // Check exp claim
-    size_t exp_pos = payload_json.find("\"exp\"");
-    if (exp_pos != std::string::npos) {
-        size_t colon = payload_json.find(':', exp_pos + 5);
-        if (colon != std::string::npos) {
-            size_t num_start = payload_json.find_first_of("0123456789", colon + 1);
-            if (num_start != std::string::npos) {
-                size_t num_end = payload_json.find_first_not_of("0123456789", num_start);
-                std::string num_str = payload_json.substr(num_start,
-                    num_end == std::string::npos ? std::string::npos : num_end - num_start);
-                long long exp_val = std::stoll(num_str);
-                // Allow 30s clock-skew tolerance
-                if (exp_val < (static_cast<long long>(std::time(nullptr)) - 30LL)) {
-                    return false;
-                }
-            }
+    // Check exp claim. Uses kislay_json_get_number (kislayphp_utils.h) instead
+    // of a raw find("\"exp\"") substring scan: a naive scan matches the FIRST
+    // byte-occurrence of "exp" anywhere in the payload, including inside a
+    // nested object or another claim's string value, not necessarily the
+    // real top-level claim - see kislay_json_find_key_value_pos's comment.
+    long long exp_val = 0;
+    if (kislay_json_get_number(payload_json, "exp", exp_val)) {
+        // Allow 30s clock-skew tolerance
+        if (exp_val < (static_cast<long long>(std::time(nullptr)) - 30LL)) {
+            return false;
         }
     }
 
@@ -894,43 +889,15 @@ static bool kislay_gateway_validate_jwt(const std::string &token,
     }
     if (diff != 0) return false;
 
-    // Extract sub claim
-    auto extract_string_claim = [&](const std::string &json,
-                                    const std::string &key) -> std::string {
-        std::string needle = "\"" + key + "\"";
-        size_t p = json.find(needle);
-        if (p == std::string::npos) return "";
-        size_t c = json.find(':', p + needle.size());
-        if (c == std::string::npos) return "";
-        size_t q1 = json.find('"', c + 1);
-        if (q1 == std::string::npos) return "";
-        size_t q2 = json.find('"', q1 + 1);
-        if (q2 == std::string::npos) return "";
-        return json.substr(q1 + 1, q2 - q1 - 1);
-    };
-    sub_out = extract_string_claim(payload_json, "sub");
+    // Extract sub/roles claims via the shared safe helpers (handle escaped
+    // quotes and require a ':' immediately after the key match, so a value
+    // elsewhere in the payload that merely contains "sub"/"roles" text can't
+    // be mistaken for the real claim - see kislayphp_utils.h).
+    sub_out = kislay_json_get_string(payload_json, "sub");
 
-    // Extract roles claim (array of strings, comma-joined)
-    std::string roles_needle = "\"roles\"";
-    size_t roles_pos = payload_json.find(roles_needle);
-    if (roles_pos != std::string::npos) {
-        size_t bracket = payload_json.find('[', roles_pos + roles_needle.size());
-        if (bracket != std::string::npos) {
-            size_t end_bracket = payload_json.find(']', bracket + 1);
-            if (end_bracket != std::string::npos) {
-                std::string arr = payload_json.substr(bracket + 1, end_bracket - bracket - 1);
-                size_t p = 0;
-                while (p < arr.size()) {
-                    size_t q1 = arr.find('"', p);
-                    if (q1 == std::string::npos) break;
-                    size_t q2 = arr.find('"', q1 + 1);
-                    if (q2 == std::string::npos) break;
-                    if (!roles_out.empty()) roles_out += ',';
-                    roles_out += arr.substr(q1 + 1, q2 - q1 - 1);
-                    p = q2 + 1;
-                }
-            }
-        }
+    for (const auto &role : kislay_json_get_string_array(payload_json, "roles")) {
+        if (!roles_out.empty()) roles_out += ',';
+        roles_out += role;
     }
 
     return true;
