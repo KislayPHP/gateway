@@ -789,6 +789,26 @@ static void kislayphp_send_error(struct mg_connection *conn, int status, const c
               message);
 }
 
+// Constant-time comparison for secret/token values. Unlike std::string's
+// operator==/!=, which short-circuits at the first differing byte, this
+// always inspects every byte of both inputs (padded to the longer length)
+// so response timing can't leak how many leading bytes of an attacker's
+// guess matched a real secret. Used for both the JWT HMAC signature check
+// below and the legacy bearer-token check in kislayphp_gateway_begin_request
+// - the latter previously used a plain std::string != comparison, a real
+// timing side-channel on the configured token that the JWT path next to it
+// was already careful to avoid.
+static bool kislay_gateway_constant_time_equals(const std::string &a, const std::string &b) {
+    size_t max_len = a.size() > b.size() ? a.size() : b.size();
+    unsigned char diff = static_cast<unsigned char>(a.size() != b.size());
+    for (size_t i = 0; i < max_len; ++i) {
+        unsigned char ca = i < a.size() ? static_cast<unsigned char>(a[i]) : 0;
+        unsigned char cb = i < b.size() ? static_cast<unsigned char>(b[i]) : 0;
+        diff |= (ca ^ cb);
+    }
+    return diff == 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // JWT helpers (HS256, no external library beyond OpenSSL)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1400,7 +1420,7 @@ static int kislayphp_gateway_begin_request(struct mg_connection *conn) {
                 }
                 std::string expected = "Bearer ";
                 expected.append(gateway->auth_bearer_token);
-                if (std::string(auth_hdr) != expected) {
+                if (!kislay_gateway_constant_time_equals(std::string(auth_hdr), expected)) {
                     kislayphp_send_error(conn, 401, "Invalid Authorization token");
                     return 1;
                 }
