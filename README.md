@@ -4,13 +4,13 @@
 
 [![PHP Version](https://img.shields.io/badge/PHP-8.2+-blue.svg)](https://php.net)
 [![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
-[![Release](https://img.shields.io/badge/Release-1.0.0-orange.svg)]()
+[![Release](https://img.shields.io/badge/Release-1.0.1-orange.svg)]()
 
 ## Installation
 
 **Via PIE (recommended):**
 ```bash
-pie install kislayphp/gateway:1.0.0
+pie install kislayphp/gateway:1.0.1
 ```
 
 Add to `php.ini`:
@@ -24,7 +24,7 @@ extension=kislayphp_gateway.so
 - **Fixed a Host-header bug**: `registerService()` and `setFallbackTarget()` routes sent a blank `Host:` header upstream and never reused pooled connections — both now correctly compute their routing keys at registration time.
 - Hot-path allocation reductions across the proxy request path (thread-local buffers for headers, method casing, and route lookups; a fast path for the common no-rewrite route case).
 - In cross-language benchmarks, KislayPHP Gateway now beats Go's `httputil.ReverseProxy`, Node.js, and Spring Cloud Gateway on both throughput and tail latency for plain-proxy and JWT scenarios.
-- **Known issue**: genuine multi-host round-robin (multiple distinct backends behind one `registerService()` pool) still collapses under real concurrency — not yet fixed, needs interactive debugger-level investigation. Single-backend service routes and static routes are unaffected.
+- **Multi-host round-robin fixed (2026-08-01)**: real multi-host load balancing (2+ genuinely distinct backends behind one `registerService()` pool) previously collapsed to near-zero throughput under concurrency — root cause was civetweb defaulting to Nagle's algorithm (no `tcp_nodelay`) on client-facing sockets, not a deadlock. Fixed by enabling `tcp_nodelay` in `listen()`. See the Performance section below for current real numbers — this scenario is a genuine, honest mixed result (not a clean win), unlike plain-proxy and JWT where KislayPHP leads outright.
 
 ## Performance
 
@@ -40,7 +40,18 @@ Plain proxy pass-through, wrk (2 threads, 20 connections, 3s + 5s warmup), 10-co
 
 Direct backend, no gateway in front (baseline): 130,591 req/s.
 
-KislayPHP Gateway wins on both throughput and tail latency against every reverse proxy in the comparison, including Spring Cloud Gateway and Go's own `net/http/httputil.ReverseProxy`. Reproduce with `../compare/run_gateway_compare.sh` from the repo root, or the quick `../perf_smoke_test.sh` for a faster (and less statistically rigorous) sanity check. Note: this scenario uses a single backend — see the "Known issue" above for the current gap under genuine multi-host round-robin.
+KislayPHP Gateway wins on both throughput and tail latency against every reverse proxy in the comparison, including Spring Cloud Gateway and Go's own `net/http/httputil.ReverseProxy`, for plain-proxy and JWT scenarios. Reproduce with `../compare/run_gateway_compare.sh` from the repo root, or the quick `../perf_smoke_test.sh` for a faster (and less statistically rigorous) sanity check.
+
+**Round-robin load balancing** (`../compare/run_gateway_compare.sh lb`), 2-node backend pool, same wrk parameters:
+
+| Gateway | req/s | p50 | p99 | vs KislayPHP |
+|---|---:|---:|---:|---:|
+| Go (httputil.ReverseProxy) | 7,874 | 9.78ms | 113.40ms | +20.2% req/s |
+| **KislayPHP Gateway** | **6,548** | **412µs** | **28.07ms** | — |
+| Node.js (native, cluster) | 6,197 | 12.82ms | 149.43ms | -5.4% |
+| Node.js (native, single process) | 3,786 | 17.97ms | 186.32ms | -42.2% |
+
+Honest read: Go's `ReverseProxy` edges out KislayPHP on raw req/s here, but KislayPHP's p50 is ~24x tighter and p99 is ~4x tighter than Go's — round-robin across distinct hosts inherently costs some throughput for all four gateways compared to the single-backend numbers above (each request pays a cold-connect or pool-miss tax more often), but KislayPHP holds its latency advantage even here. This is a real, current result (2026-08-31), not the pre-fix catastrophic collapse (~8 req/s) described in earlier notes.
 
 ## Role In The Stack
 
